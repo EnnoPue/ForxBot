@@ -2,6 +2,8 @@ import asyncio
 import json
 import os
 import re
+import threading
+import time as _time
 import requests
 import pandas as pd
 from datetime import datetime, timezone, date
@@ -18,20 +20,52 @@ TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 ANTHROPIC_KEY    = os.getenv("ANTHROPIC_API_KEY", "")
 TWELVE_KEY       = os.getenv("TWELVE_DATA_KEY", "")
-AI_MODEL         = os.getenv("AI_MODEL", "claude-opus-4-8")
+AI_MODEL         = os.getenv("AI_MODEL", "claude-opus-4-8")            # Signal-Recherche (premium)
+AI_MODEL_CHAT    = os.getenv("AI_MODEL_CHAT", "claude-sonnet-4-6")     # Chat-Fragen (günstig)
 
-PAIRS = ["EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF", "AUD/USD", "USD/CAD", "NZD/USD"]
+# 7 Majors + die meistgehandelten zusätzlichen Paare (inkl. Gold).
+# Bewusst kompakt gehalten, damit der 1h-Scan im Twelve-Data-Free-Tier bleibt.
+# Über die Variable PAIRS frei überschreibbar.
+DEFAULT_PAIRS = [
+    # Majors
+    "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF", "AUD/USD", "USD/CAD", "NZD/USD",
+    # Größte/meistgehandelte zusätzliche Paare
+    "EUR/JPY", "GBP/JPY", "EUR/GBP", "EUR/CHF", "AUD/JPY", "EUR/AUD",
+    "GBP/CHF", "CAD/JPY",
+    # Gold (sehr hohes Volumen)
+    "XAU/USD",
+]
+_pairs_env = os.getenv("PAIRS", "").strip()
+PAIRS = ([p.strip().upper() for p in _pairs_env.split(",") if p.strip()]
+         if _pairs_env else DEFAULT_PAIRS)
+
 INTERVAL          = "1h"        # Daytrading-Zeitfenster
 PRESCREEN_MIN     = 60          # Technischer Vorab-Filter
 CONFIDENCE_MIN    = 75          # KI-Confidence-Schwelle für ein echtes Signal
 MAX_SIGNALS_DAY   = 3           # max. Signale pro Tag
+MAX_AI_PER_SCAN   = 4           # max. teure KI-Analysen pro Scan (Kostenschutz)
 MIN_RR            = 1.5         # Mindest-Chance-Risiko-Verhältnis
-SCAN_INTERVAL_MIN = 90          # Scan-Takt während Marktzeiten
-SIGNAL_COOLDOWN_H = 6           # selbes Paar nicht öfter als alle 6h
+SCAN_INTERVAL_MIN = 60          # stündlicher Scan
+SIGNAL_COOLDOWN_H = 6           # selbes Paar nicht öfter als alle 6h (nach Signal)
+ANALYSIS_COOLDOWN_H = 4         # selbes Paar nicht öfter als alle 4h von Opus analysieren (Kostenschutz)
+TD_MIN_GAP        = 8.0         # min. Sekunden zwischen Twelve-Data-Calls (≈8/min)
 STATE_FILE        = "state.json"
 
 anthropic = Anthropic(api_key=ANTHROPIC_KEY)
 scan_lock = asyncio.Lock()
+
+# Durchsatz-Begrenzer für Twelve Data (Free: 8 Calls/Min). Thread-sicher,
+# da fetch_* über asyncio.to_thread in Worker-Threads laufen.
+_td_lock = threading.Lock()
+_td_last = [0.0]
+
+def _td_throttle():
+    with _td_lock:
+        now = _time.monotonic()
+        wait = TD_MIN_GAP - (now - _td_last[0])
+        if wait > 0:
+            _time.sleep(wait)
+        _td_last[0] = _time.monotonic()
 
 # ═══════════════════════════════════════════════════════════════
 #  HELFER — JSON, Session, Validierung
@@ -114,18 +148,21 @@ def validate_signal(s: dict) -> dict | None:
 # ═══════════════════════════════════════════════════════════════
 chat_history: list = []
 signals_today = {"date": str(date.today()), "count": 0}
-last_signal_time: dict = {}   # pair -> ISO timestamp
+last_signal_time: dict = {}     # pair -> ISO timestamp (nach gesendetem Signal)
+last_analysis_time: dict = {}   # pair -> ISO timestamp (nach Opus-Analyse, egal welches Ergebnis)
 scan_stats = {"last_run": None, "candidates": 0, "rejections": []}
 
 def save_state():
     try:
         with open(STATE_FILE, "w") as f:
-            json.dump({"signals_today": signals_today, "last_signal_time": last_signal_time}, f)
+            json.dump({"signals_today": signals_today,
+                       "last_signal_time": last_signal_time,
+                       "last_analysis_time": last_analysis_time}, f)
     except Exception as e:
         print(f"[STATE save] {e}")
 
 def load_state():
-    global signals_today, last_signal_time
+    global signals_today, last_signal_time, last_analysis_time
     if not os.path.exists(STATE_FILE):
         return
     try:
@@ -133,6 +170,7 @@ def load_state():
             d = json.load(f)
         signals_today = d.get("signals_today", signals_today)
         last_signal_time = d.get("last_signal_time", {})
+        last_analysis_time = d.get("last_analysis_time", {})
     except Exception as e:
         print(f"[STATE load] {e}")
 
@@ -159,6 +197,7 @@ async def tg_send(bot: Bot, text: str):
 #  TWELVE DATA — OHLC laden
 # ═══════════════════════════════════════════════════════════════
 def fetch_ohlc(pair: str, interval: str = INTERVAL, size: int = 250) -> pd.DataFrame | None:
+    _td_throttle()
     url = ("https://api.twelvedata.com/time_series"
            f"?symbol={pair}&interval={interval}&outputsize={size}&apikey={TWELVE_KEY}")
     try:
@@ -177,6 +216,7 @@ def fetch_ohlc(pair: str, interval: str = INTERVAL, size: int = 250) -> pd.DataF
         return None
 
 def fetch_price(pair: str) -> float | None:
+    _td_throttle()
     url = f"https://api.twelvedata.com/price?symbol={pair}&apikey={TWELVE_KEY}"
     try:
         r = requests.get(url, timeout=15)
@@ -195,7 +235,10 @@ def htf_trend(pair: str) -> dict | None:
 #  PIP-HELFER
 # ═══════════════════════════════════════════════════════════════
 def pip_size(pair: str) -> float:
-    return 0.01 if "JPY" in pair else 0.0001
+    if pair.startswith("XAU"): return 0.1     # Gold (broker-abhängig)
+    if pair.startswith("XAG"): return 0.01    # Silber
+    if "JPY" in pair: return 0.01
+    return 0.0001
 
 def pips_between(pair: str, a: float, b: float) -> float:
     return abs(a - b) / pip_size(pair)
@@ -256,7 +299,7 @@ Antworte mit einer kurzen Analyse und am ENDE einem JSON-Block in genau diesem F
         resp = anthropic.messages.create(
             model=AI_MODEL,
             max_tokens=2500,
-            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 6}],
+            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 4}],
             messages=[{"role": "user", "content": prompt}],
         )
         text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
@@ -325,6 +368,14 @@ def cooldown_ok(pair: str) -> bool:
     last = datetime.fromisoformat(ts)
     return (datetime.now() - last).total_seconds() / 3600 >= SIGNAL_COOLDOWN_H
 
+def analysis_cooldown_ok(pair: str) -> bool:
+    """Verhindert, dass dasselbe Paar zu oft (teuer) von Opus analysiert wird."""
+    ts = last_analysis_time.get(pair)
+    if not ts:
+        return True
+    last = datetime.fromisoformat(ts)
+    return (datetime.now() - last).total_seconds() / 3600 >= ANALYSIS_COOLDOWN_H
+
 async def scan(bot: Bot):
     if scan_lock.locked():
         print(f"[{datetime.now():%H:%M}] Scan läuft bereits — übersprungen.")
@@ -356,13 +407,11 @@ async def scan(bot: Bot):
             print(f"  {pair}: 1h-prescreen {score}/100 ({direction}, ADX {a['adx']:.0f})")
             if score >= PRESCREEN_MIN and direction != "none":
                 candidates.append((pair, direction, a, score))
-            await asyncio.sleep(1.5)   # Twelve Data Rate Limit schonen
 
         # ── Stufe 2: 4h-Multi-Timeframe-Filter ──
         aligned = []
         for pair, direction, a, score in candidates:
             htf = await asyncio.to_thread(htf_trend, pair)
-            await asyncio.sleep(1.5)
             if htf:
                 # Konflikt mit höherem Zeitfenster → raus
                 if direction == "long" and htf["trend"] == "bearish":
@@ -379,10 +428,20 @@ async def scan(bot: Bot):
 
         # ── Stufe 3: KI-Tiefenanalyse (beste zuerst) ──
         aligned.sort(key=lambda x: x[3], reverse=True)
+        ai_calls = 0
         for pair, direction, a, score, htf in aligned:
             if signals_today["count"] >= MAX_SIGNALS_DAY:
                 break
+            if ai_calls >= MAX_AI_PER_SCAN:
+                print(f"  KI-Limit ({MAX_AI_PER_SCAN}) erreicht — Rest beim nächsten Scan.")
+                break
+            if not analysis_cooldown_ok(pair):
+                print(f"  {pair}: Analyse-Cooldown aktiv — übersprungen (spart Kosten)")
+                continue
             print(f"  → KI-Analyse {pair} ({direction})...")
+            ai_calls += 1
+            last_analysis_time[pair] = datetime.now().isoformat()
+            save_state()
             raw = await asyncio.to_thread(deep_analysis, pair, direction, a, htf)
             if not raw or not raw.get("trade"):
                 scan_stats["rejections"].append(f"{pair}: kein Setup")
@@ -413,20 +472,26 @@ async def scan(bot: Bot):
 # ═══════════════════════════════════════════════════════════════
 #  KI-CHAT
 # ═══════════════════════════════════════════════════════════════
-def ai_chat(user_msg: str) -> str:
+def ai_chat(user_msg: str, deep: bool = False) -> str:
+    """
+    Beantwortet Nutzerfragen. Standard: Sonnet 4.6 (günstig).
+    deep=True: Opus 4.8 für premium-recherchierte Antworten (per /deep).
+    """
     global chat_history
     chat_history.append({"role": "user", "content": user_msg})
     if len(chat_history) > 16:
         chat_history = chat_history[-16:]
+    model = AI_MODEL if deep else AI_MODEL_CHAT
+    max_uses = 6 if deep else 3
     sys = ("Du bist ein erfahrener Forex-Daytrading-Assistent. Antworte auf Deutsch, "
            "präzise und sachlich. Du darfst live im Web recherchieren (Kurse, News, Kalender, "
            "Sentiment). Du gibst klare Einschätzungen mit Begründung, weist auf Risiken hin, "
            "und machst keine Garantieversprechen. Halte Antworten Telegram-tauglich kurz.")
     try:
         resp = anthropic.messages.create(
-            model=AI_MODEL, max_tokens=1200,
+            model=model, max_tokens=900,
             system=[{"type": "text", "text": sys, "cache_control": {"type": "ephemeral"}}],
-            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 4}],
+            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": max_uses}],
             messages=chat_history,
         )
         answer = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
@@ -447,8 +512,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Überwacht: {', '.join(PAIRS)}\n"
         f"Max {MAX_SIGNALS_DAY} Signale/Tag, nur Confidence ≥ {CONFIDENCE_MIN}/100\n\n"
         f"/status — Status & Session\n/scan — Sofort-Scan\n/today — Tagesübersicht\n"
-        f"/lot — Positionsgröße berechnen\n/pairs — Paare\n/help — Hilfe\n\n"
-        f"💬 Stell mir jederzeit Fragen zum Markt!")
+        f"/lot — Positionsgröße berechnen\n/deep <frage> — Premium-Recherche\n/pairs — Paare\n/help — Hilfe\n\n"
+        f"💬 Normale Fragen → günstig (Sonnet). Wichtige → /deep (Opus 4.8)")
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -461,7 +526,9 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Das Chance/Risiko wird aus den echten Levels nachgerechnet.\n\n"
         "Es kann gut sein, dass mal ein ganzer Tag kein Signal kommt — das ist Absicht.\n\n"
         "/status — Markt, Session, Schwellen\n/scan — manuell scannen\n/today — was heute lief\n"
-        "/lot — Positionsgröße aus Risiko berechnen\n/pairs — überwachte Paare\n\n"
+        "/lot — Positionsgröße aus Risiko berechnen\n/deep <frage> — Premium-Recherche (Opus 4.8)\n/pairs — überwachte Paare\n\n"
+        "Normale Fragen beantworte ich günstig mit Sonnet 4.6 (inkl. Websuche).\n"
+        "Für die wichtigen Fragen nutz /deep — das läuft auf Opus 4.8.\n\n"
         "Frag mich z.B.:\n„Was ist gerade los bei EUR/USD?“\n„Welche News stehen heute an?“")
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -533,6 +600,10 @@ async def cmd_lot(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lots = risk_amount / (sl_pips * pip_val_lot)
     units = lots * 100000
 
+    note = ""
+    if pair.startswith(("XAU", "XAG")):
+        note = "\n⚠️ Metalle: Lot-Konventionen variieren stark je Broker — hier nur grobe Orientierung."
+
     await update.message.reply_text(
         f"💰 POSITIONSGRÖSSE — {pair}\n"
         f"══════════════════════\n"
@@ -542,7 +613,24 @@ async def cmd_lot(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"➡️ {units:,.0f} Einheiten\n"
         f"➡️ Mikrolots: {lots*100:.0f}\n\n"
         f"Bei SL-Hit verlierst du genau {risk_amount:.2f} (≈{risk_pct:.1f}%).\n"
-        f"⚠️ Näherung; je nach Broker/Kontowährung leicht abweichend.")
+        f"⚠️ Näherung; je nach Broker/Kontowährung leicht abweichend.{note}")
+
+async def cmd_deep(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/deep <frage> — premium-recherchierte Antwort über Opus 4.8."""
+    if not ctx.args:
+        await update.message.reply_text(
+            "🔬 Premium-Recherche (Opus 4.8)\n\n"
+            "Nutzung: /deep <deine Frage>\n"
+            "Beispiel: /deep Wie ist der Ausblick für EUR/USD diese Woche?\n\n"
+            "Kostet mehr als normale Fragen — nutz es für die wichtigen.")
+        return
+    question = " ".join(ctx.args)
+    thinking = await update.message.reply_text("🔬 Tiefen-Recherche mit Opus 4.8...")
+    answer = await asyncio.to_thread(ai_chat, question, True)
+    try:
+        await thinking.edit_text(answer)
+    except Exception:
+        await update.message.reply_text(answer)
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message.text
@@ -570,7 +658,7 @@ async def scanner_loop(bot: Bot):
 async def main():
     print("=" * 55)
     print("  📊 Forex Signal Bot — OPUS 4.8")
-    print(f"  Paare: {len(PAIRS)} | Modell: {AI_MODEL}")
+    print(f"  Paare: {len(PAIRS)} | Signal-Modell: {AI_MODEL} | Chat: {AI_MODEL_CHAT}")
     print("=" * 55)
     if not TELEGRAM_TOKEN:
         print("❌ TELEGRAM_TOKEN fehlt!"); return
@@ -588,6 +676,7 @@ async def main():
     app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(CommandHandler("today", cmd_today))
     app.add_handler(CommandHandler("lot", cmd_lot))
+    app.add_handler(CommandHandler("deep", cmd_deep))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     await app.initialize()
