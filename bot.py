@@ -20,8 +20,9 @@ TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 ANTHROPIC_KEY    = os.getenv("ANTHROPIC_API_KEY", "")
 TWELVE_KEY       = os.getenv("TWELVE_DATA_KEY", "")
-AI_MODEL         = os.getenv("AI_MODEL", "claude-opus-4-8")            # Signal-Recherche (premium)
+AI_MODEL_SIGNAL  = os.getenv("AI_MODEL_SIGNAL", "claude-sonnet-4-6")  # Signal-Analyse (günstig, gute Qualität)
 AI_MODEL_CHAT    = os.getenv("AI_MODEL_CHAT", "claude-sonnet-4-6")     # Chat-Fragen (günstig)
+AI_MODEL_DEEP    = os.getenv("AI_MODEL_DEEP", "claude-opus-4-8")       # /deep Premium-Recherche
 
 # 7 Majors + die meistgehandelten zusätzlichen Paare (inkl. Gold).
 # Bewusst kompakt gehalten, damit der 1h-Scan im Twelve-Data-Free-Tier bleibt.
@@ -43,7 +44,7 @@ INTERVAL          = "1h"        # Daytrading-Zeitfenster
 PRESCREEN_MIN     = 60          # Technischer Vorab-Filter
 CONFIDENCE_MIN    = 75          # KI-Confidence-Schwelle für ein echtes Signal
 MAX_SIGNALS_DAY   = 3           # max. Signale pro Tag
-MAX_AI_PER_SCAN   = 4           # max. teure KI-Analysen pro Scan (Kostenschutz)
+MAX_AI_PER_SCAN   = 2           # max. KI-Analysen pro Scan (Kostenschutz, Stufe "ausgewogen")
 MIN_RR            = 1.5         # Mindest-Chance-Risiko-Verhältnis
 SCAN_INTERVAL_MIN = 60          # stündlicher Scan
 SIGNAL_COOLDOWN_H = 6           # selbes Paar nicht öfter als alle 6h (nach Signal)
@@ -297,9 +298,9 @@ Antworte mit einer kurzen Analyse und am ENDE einem JSON-Block in genau diesem F
 
     try:
         resp = anthropic.messages.create(
-            model=AI_MODEL,
-            max_tokens=2500,
-            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 4}],
+            model=AI_MODEL_SIGNAL,
+            max_tokens=1200,
+            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
             messages=[{"role": "user", "content": prompt}],
         )
         text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
@@ -481,7 +482,7 @@ def ai_chat(user_msg: str, deep: bool = False) -> str:
     chat_history.append({"role": "user", "content": user_msg})
     if len(chat_history) > 16:
         chat_history = chat_history[-16:]
-    model = AI_MODEL if deep else AI_MODEL_CHAT
+    model = AI_MODEL_DEEP if deep else AI_MODEL_CHAT
     max_uses = 6 if deep else 3
     sys = ("Du bist ein erfahrener Forex-Daytrading-Assistent. Antworte auf Deutsch, "
            "präzise und sachlich. Du darfst live im Web recherchieren (Kurse, News, Kalender, "
@@ -658,7 +659,7 @@ async def scanner_loop(bot: Bot):
 async def main():
     print("=" * 55)
     print("  📊 Forex Signal Bot — OPUS 4.8")
-    print(f"  Paare: {len(PAIRS)} | Signal-Modell: {AI_MODEL} | Chat: {AI_MODEL_CHAT}")
+    print(f"  Paare: {len(PAIRS)} | Signal: {AI_MODEL_SIGNAL} | Chat: {AI_MODEL_CHAT} | Deep: {AI_MODEL_DEEP}")
     print("=" * 55)
     if not TELEGRAM_TOKEN:
         print("❌ TELEGRAM_TOKEN fehlt!"); return
