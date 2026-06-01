@@ -40,15 +40,16 @@ _pairs_env = os.getenv("PAIRS", "").strip()
 PAIRS = ([p.strip().upper() for p in _pairs_env.split(",") if p.strip()]
          if _pairs_env else DEFAULT_PAIRS)
 
-INTERVAL          = "1h"        # Daytrading-Zeitfenster
-PRESCREEN_MIN     = 60          # Technischer Vorab-Filter
-CONFIDENCE_MIN    = 75          # KI-Confidence-Schwelle für ein echtes Signal
-MAX_SIGNALS_DAY   = 3           # max. Signale pro Tag
-MAX_AI_PER_SCAN   = 2           # max. KI-Analysen pro Scan (Kostenschutz, Stufe "ausgewogen")
+INTERVAL          = os.getenv("INTERVAL", "30min")   # Daytrading-Zeitfenster (kürzer = mehr Setups)
+HTF_INTERVAL      = "4h"        # übergeordneter Trend für Multi-Timeframe
+PRESCREEN_MIN     = 58          # Technischer Vorab-Filter
+CONFIDENCE_MIN    = int(os.getenv("CONFIDENCE_MIN", "73"))  # KI-Confidence-Schwelle
+MAX_SIGNALS_DAY   = int(os.getenv("MAX_SIGNALS_DAY", "4"))  # max. Signale pro Tag
+MAX_AI_PER_SCAN   = 2           # max. KI-Analysen pro Scan (Kostenschutz)
 MIN_RR            = 1.5         # Mindest-Chance-Risiko-Verhältnis
-SCAN_INTERVAL_MIN = 60          # stündlicher Scan
-SIGNAL_COOLDOWN_H = 6           # selbes Paar nicht öfter als alle 6h (nach Signal)
-ANALYSIS_COOLDOWN_H = 4         # selbes Paar nicht öfter als alle 4h von Opus analysieren (Kostenschutz)
+SCAN_INTERVAL_MIN = 45          # Scan-Takt (häufiger fürs Daytrading)
+SIGNAL_COOLDOWN_H = 4           # selbes Paar nicht öfter als alle 4h (nach Signal)
+ANALYSIS_COOLDOWN_H = 3         # selbes Paar nicht öfter als alle 3h von der KI analysieren
 TD_MIN_GAP        = 8.0         # min. Sekunden zwischen Twelve-Data-Calls (≈8/min)
 STATE_FILE        = "state.json"
 
@@ -226,8 +227,8 @@ def fetch_price(pair: str) -> float | None:
         return None
 
 def htf_trend(pair: str) -> dict | None:
-    """Übergeordneter 4h-Trend für Multi-Timeframe-Confluence."""
-    df = fetch_ohlc(pair, interval="4h", size=250)
+    """Übergeordneter Trend für Multi-Timeframe-Confluence."""
+    df = fetch_ohlc(pair, interval=HTF_INTERVAL, size=250)
     if df is None or len(df) < 210:
         return None
     return ind.analyze(df)
@@ -254,15 +255,15 @@ def deep_analysis(pair: str, direction: str, a: dict, htf: dict | None) -> dict 
     Levels ableiten und begründen. Gibt geparste JSON-Signal zurück.
     """
     ps = pip_size(pair)
-    htf_block = "Keine 4h-Daten verfügbar."
+    htf_block = f"Keine {HTF_INTERVAL}-Daten verfügbar."
     if htf:
-        htf_block = (f"4h-Trend: {htf['trend']} (EMA20={htf['ema20']:.5f}, "
-                     f"EMA50={htf['ema50']:.5f}), 4h-RSI={htf['rsi']:.1f}, "
-                     f"4h-ADX={htf['adx']:.1f}, 4h-Swing-Hoch={htf['swing_high']:.5f}, "
-                     f"4h-Swing-Tief={htf['swing_low']:.5f}")
-    prompt = f"""Du bist ein professioneller Forex-Daytrader. Analysiere {pair} für einen möglichen {('LONG' if direction=='long' else 'SHORT')}-Trade auf dem 1h-Chart.
+        htf_block = (f"{HTF_INTERVAL}-Trend: {htf['trend']} (EMA20={htf['ema20']:.5f}, "
+                     f"EMA50={htf['ema50']:.5f}), RSI={htf['rsi']:.1f}, "
+                     f"ADX={htf['adx']:.1f}, Swing-Hoch={htf['swing_high']:.5f}, "
+                     f"Swing-Tief={htf['swing_low']:.5f}")
+    prompt = f"""Du bist ein professioneller Forex-Daytrader. Analysiere {pair} für einen möglichen {('LONG' if direction=='long' else 'SHORT')}-Trade auf dem {INTERVAL}-Chart (Daytrading, Intraday).
 
-TECHNISCHE DATEN 1h (bereits berechnet):
+TECHNISCHE DATEN {INTERVAL} (bereits berechnet):
 - Aktueller Preis: {a['price']:.5f}
 - Trend: {a['trend']} (EMA20={a['ema20']:.5f}, EMA50={a['ema50']:.5f}, EMA200={a['ema200']:.5f})
 - RSI(14): {a['rsi']:.1f}
@@ -273,9 +274,9 @@ TECHNISCHE DATEN 1h (bereits berechnet):
 - Jüngstes Swing-Tief: {a['swing_low']:.5f}
 - Pip-Größe: {ps}
 
-ÜBERGEORDNETER 4h-KONTEXT (Multi-Timeframe):
+ÜBERGEORDNETER {HTF_INTERVAL}-KONTEXT (Multi-Timeframe):
 - {htf_block}
-- WICHTIG: Handle bevorzugt MIT dem 4h-Trend. Wenn 1h und 4h widersprechen, sei besonders streng oder lehne ab.
+- WICHTIG: Handle bevorzugt MIT dem {HTF_INTERVAL}-Trend. Wenn {INTERVAL} und {HTF_INTERVAL} widersprechen, sei besonders streng oder lehne ab.
 
 DEINE AUFGABE — recherchiere im Web (nutze die Suche aktiv):
 1. FUNDAMENTAL: Aktuelle Zinsdifferenz/Notenbank-Haltung der beiden Währungen, jüngste Wirtschaftsdaten, anstehende High-Impact-News in den nächsten 12h (ForexFactory-Kalender). Wenn ein großes Event unmittelbar bevorsteht → Confidence senken oder ablehnen.
@@ -325,7 +326,7 @@ def format_signal(pair: str, s: dict, htf: dict | None) -> str:
     is_long = s["direction"] == "long"
     arrow = "🟢 KAUFEN (Buy Limit)" if is_long else "🔴 VERKAUFEN (Sell Limit)"
     digits = 3 if "JPY" in pair else 5
-    htf_line = f"\n📐 4h-Trend: {htf['trend']}" if htf else ""
+    htf_line = f"\n📐 {HTF_INTERVAL}-Trend: {htf['trend']}" if htf else ""
 
     return (
         f"📊 FOREX SIGNAL — {pair}\n"
@@ -519,8 +520,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 So funktioniert der Bot:\n\n"
-        f"Er scannt die 7 Major-Paare im 1h-Takt, filtert technisch vor (Trend, RSI, MACD, ADX-Trendstärke), "
-        f"prüft den übergeordneten 4h-Trend (Multi-Timeframe) und lässt nur die besten Setups von Opus 4.8 "
+        f"Er scannt die {len(PAIRS)} Paare im {INTERVAL}-Takt (Daytrading), filtert technisch vor (Trend, RSI, MACD, ADX-Trendstärke), "
+        f"prüft den übergeordneten {HTF_INTERVAL}-Trend (Multi-Timeframe) und lässt nur die besten Setups von der KI "
         f"analysieren — inkl. Live-Recherche zu Fundamental und Sentiment der großen Trader.\n\n"
         f"Nur Signale mit Confidence ≥ {CONFIDENCE_MIN} und Chance/Risiko ≥ 1:{MIN_RR} werden geschickt. "
         f"Stop-Loss und Take-Profit kommen aus echter Marktstruktur (ATR + Swing-Levels), nicht aus festen Prozenten. "
