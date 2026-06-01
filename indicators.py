@@ -109,8 +109,8 @@ def prescreen_score(ind: dict) -> tuple[int, str]:
     hist, hist_prev = ind["macd_hist"], ind["macd_hist_prev"]
     adx_v = ind.get("adx", 0)
 
-    # Trendstärke-Gate: unter 18 = kein klarer Trend → ablehnen
-    if adx_v < 18 or trend == "neutral":
+    # Trendstärke-Gate: unter 16 = kein klarer Trend → ablehnen (für 30m-Zeitfenster)
+    if adx_v < 16 or trend == "neutral":
         return 0, "none"
 
     score = 0
