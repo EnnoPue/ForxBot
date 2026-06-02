@@ -8,8 +8,9 @@ import requests
 import pandas as pd
 from datetime import datetime, timezone, date
 from anthropic import Anthropic
-from telegram import Update, Bot
-from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
+from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (Application, MessageHandler, CommandHandler,
+                          CallbackQueryHandler, filters, ContextTypes)
 
 import indicators as ind
 
@@ -42,12 +43,39 @@ HTF_INTERVAL      = "1h"        # übergeordneter Trend (1h passt zu 15min-Scalp
 PRESCREEN_MIN     = 55          # Technischer Vorab-Filter (etwas lockerer fürs Scalping)
 CONFIDENCE_MIN    = int(os.getenv("CONFIDENCE_MIN", "70"))  # KI-Confidence-Schwelle
 MAX_SIGNALS_DAY   = int(os.getenv("MAX_SIGNALS_DAY", "6"))  # mehr Signale beim Scalping
+MAX_SIGNALS_PER_SCAN = 2        # nicht mehr als 2 Signale auf einmal (kein Schwung)
 MAX_AI_PER_SCAN   = 2           # max. KI-Analysen pro Scan (Kostenschutz)
 MIN_RR            = 1.5         # Mindest-Chance-Risiko-Verhältnis
 SCAN_INTERVAL_MIN = 25          # Scan-Takt (häufig fürs Scalping)
 SIGNAL_COOLDOWN_H = 2           # selbes Paar nicht öfter als alle 2h signalisieren
 ANALYSIS_COOLDOWN_H = 2         # selbes Paar nicht öfter als alle 2h analysieren
 HTF_TOP_CANDIDATES = 3          # nur für die besten N Kandidaten den HTF-Trend laden (Credit-Schutz)
+
+# Lot-Vorschlag im Signal: Kontogröße + Risiko-Band (skaliert mit Confidence)
+ACCOUNT_SIZE  = float(os.getenv("ACCOUNT_SIZE", "100000"))   # dein (Demo-)Konto
+RISK_MIN_PCT  = float(os.getenv("RISK_MIN_PCT", "0.25"))     # Risiko bei min. Confidence
+RISK_MAX_PCT  = float(os.getenv("RISK_MAX_PCT", "1.0"))      # Risiko bei Confidence 100
+MAX_LOT       = float(os.getenv("MAX_LOT", "5"))             # Obergrenze für den Vorschlag
+
+# ─── OANDA-Trading (Demo standardmäßig) ───
+OANDA_TOKEN      = os.getenv("OANDA_TOKEN", "")
+OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID", "")
+OANDA_ENV        = os.getenv("OANDA_ENV", "practice")        # practice = Demo, live = echt
+TRADING_ENABLED  = os.getenv("TRADING_ENABLED", "false").lower() == "true"
+OANDA_BASE = ("https://api-fxpractice.oanda.com" if OANDA_ENV == "practice"
+              else "https://api-fxtrade.oanda.com")
+NUM_TPS          = int(os.getenv("NUM_TPS", "3"))            # Anzahl Take-Profit-Stufen (= Teil-Trades)
+
+# ─── Broker-Auswahl: "capital" (Capital.com) oder "oanda" ───
+BROKER           = os.getenv("BROKER", "capital").lower()
+# Capital.com (Demo standardmäßig)
+CAPITAL_API_KEY    = os.getenv("CAPITAL_API_KEY", "")
+CAPITAL_IDENTIFIER = os.getenv("CAPITAL_IDENTIFIER", "")     # Login/E-Mail
+CAPITAL_PASSWORD   = os.getenv("CAPITAL_PASSWORD", "")       # das CUSTOM-Passwort des API-Keys
+CAPITAL_ENV        = os.getenv("CAPITAL_ENV", "demo")        # demo oder live
+CAPITAL_SIZE_FACTOR = float(os.getenv("CAPITAL_SIZE_FACTOR", "1.0"))  # Lot -> Capital-Size kalibrieren
+CAPITAL_BASE = ("https://demo-api-capital.backend-capital.com" if CAPITAL_ENV == "demo"
+                else "https://api-capital.backend-capital.com")
 TD_MIN_GAP        = 8.0         # min. Sekunden zwischen Twelve-Data-Calls (≈8/min)
 STATE_FILE        = "state.json"
 
@@ -138,9 +166,25 @@ def validate_signal(s: dict) -> dict | None:
     reward = abs(tp - entry)
     if risk <= 0:
         return None
-    s["entry"], s["stop_loss"], s["take_profit"] = entry, sl, tp
+    # Take-Profit-Liste normalisieren + validieren (jede Stufe auf der richtigen Seite)
+    tps = s.get("take_profits") or [tp]
+    clean_tps = []
+    for t in tps:
+        tf = safe_float(t)
+        if tf is None:
+            continue
+        if d == "long" and tf > entry:
+            clean_tps.append(tf)
+        elif d == "short" and tf < entry:
+            clean_tps.append(tf)
+    if not clean_tps:
+        return None
+    clean_tps = sorted(clean_tps, reverse=(d == "short"))
+    s["take_profits"] = clean_tps
+    s["take_profit"] = clean_tps[0]
+    s["entry"], s["stop_loss"] = entry, sl
     s["confidence"] = conf
-    s["risk_reward"] = round(reward / risk, 2)   # autoritativ, neu berechnet
+    s["risk_reward"] = round(abs(clean_tps[0] - entry) / risk, 2)   # R:R der ersten Stufe
     return s
 
 # ═══════════════════════════════════════════════════════════════
@@ -244,6 +288,34 @@ def pip_size(pair: str) -> float:
 def pips_between(pair: str, a: float, b: float) -> float:
     return abs(a - b) / pip_size(pair)
 
+def pip_value_per_lot(pair: str, price: float) -> float:
+    """Pip-Wert pro Standard-Lot (100k) grob in Kontowährung (≈USD/EUR)."""
+    if pair.endswith("USD"):
+        return 10.0
+    if pair.startswith("USD") and price > 0:
+        return (pip_size(pair) / price) * 100000
+    if pair.startswith(("XAU", "XAG")):
+        return 10.0   # grobe Näherung (broker-abhängig)
+    return 10.0
+
+def suggest_lot(confidence: float, sl_pips: float, pair: str, price: float):
+    """
+    Lot-Vorschlag skaliert mit Confidence:
+    niedrige Confidence → kleine Lot, hohe → größere (innerhalb Risiko-Band).
+    Gibt (lots, risk_pct, capped) zurück.
+    """
+    span = max(1.0, 100 - CONFIDENCE_MIN)
+    frac = min(max((confidence - CONFIDENCE_MIN) / span, 0.0), 1.0)
+    risk_pct = RISK_MIN_PCT + frac * (RISK_MAX_PCT - RISK_MIN_PCT)
+    risk_amount = ACCOUNT_SIZE * risk_pct / 100
+    pvl = pip_value_per_lot(pair, price)
+    lots = risk_amount / (sl_pips * pvl) if (sl_pips > 0 and pvl > 0) else 0
+    capped = False
+    if lots > MAX_LOT:
+        lots, capped = MAX_LOT, True
+    lots = max(round(lots, 2), 0.01)
+    return lots, risk_pct, capped
+
 # ═══════════════════════════════════════════════════════════════
 #  KI-ANALYSE  (Opus 4.8 mit Live-Websuche)
 # ═══════════════════════════════════════════════════════════════
@@ -263,18 +335,22 @@ def build_technical_signal(pair: str, direction: str, a: dict, htf: dict | None)
     if direction == "long":
         entry = price - 0.3 * atr           # leichter Pullback-Einstieg
         sl    = entry - risk
-        tp_struct = a["swing_high"]
-        rr_struct = (tp_struct - entry) / risk if risk > 0 else 0
-        tp = tp_struct if (MIN_RR <= rr_struct <= 4.0) else entry + 2.0 * risk
+        base  = entry - risk
+        tp1 = entry + 1.5 * risk
+        tp2 = entry + 2.5 * risk
+        tp3 = a["swing_high"] if a["swing_high"] > entry + 1.5 * risk else entry + 4.0 * risk
+        tps = sorted([tp1, tp2, tp3])[:NUM_TPS]
     else:  # short
         entry = price + 0.3 * atr
         sl    = entry + risk
-        tp_struct = a["swing_low"]
-        rr_struct = (entry - tp_struct) / risk if risk > 0 else 0
-        tp = tp_struct if (MIN_RR <= rr_struct <= 4.0) else entry - 2.0 * risk
+        tp1 = entry - 1.5 * risk
+        tp2 = entry - 2.5 * risk
+        tp3 = a["swing_low"] if a["swing_low"] < entry - 1.5 * risk else entry - 4.0 * risk
+        tps = sorted([tp1, tp2, tp3], reverse=True)[:NUM_TPS]
 
-    rr = abs(tp - entry) / abs(entry - sl) if entry != sl else 0
-    if rr < MIN_RR:
+    tp_first = tps[0]
+    rr = abs(tp_first - entry) / abs(entry - sl) if entry != sl else 0
+    if round(rr, 2) < MIN_RR:
         return {"trade": False}
 
     # ── Confidence aus Confluence (0-100) ──
@@ -294,25 +370,26 @@ def build_technical_signal(pair: str, direction: str, a: dict, htf: dict | None)
     if rr >= 2.5: conf += 5
     conf = max(0, min(conf, 100))
 
-    # ── Haltedauer grob schätzen ──
-    ratio = abs(tp - entry) / atr
+    # ── Haltedauer grob schätzen (bis TP1) ──
+    ratio = abs(tp_first - entry) / atr
     mins = ratio * 15 * 1.2
     if mins < 60:     hold = f"~{max(15, int(round(mins/15))*15)} Min"
     elif mins < 180:  hold = "1-3 Stunden"
     else:             hold = "mehrere Stunden"
 
     trend_word = "Aufwärts" if direction == "long" else "Abwärts"
-    tp_kind = "am Swing-Level" if tp == tp_struct else "bei 2R (ATR)"
     reasoning = (f"{trend_word}trend (EMA20/50/200 gestaffelt), ADX {adx:.0f} = "
                  f"{'starker' if adx >= 25 else 'moderater'} Trend, RSI {rsi:.0f}, "
                  f"MACD-Momentum {'positiv' if hist > 0 else 'negativ'}"
                  f"{', 4h bestätigt' if aligned else ''}. "
-                 f"Einstieg am Pullback, Stop 1,5×ATR (volatilitätsbasiert), Ziel {tp_kind}.")
+                 f"Einstieg am Pullback, Stop 1,5×ATR (volatilitätsbasiert), "
+                 f"{len(tps)} Take-Profit-Stufen zum Ausskalieren.")
 
     return {
         "trade": True,
         "direction": direction,
-        "entry": entry, "stop_loss": sl, "take_profit": tp,
+        "entry": entry, "stop_loss": sl,
+        "take_profit": tp_first, "take_profits": tps,
         "confidence": conf, "risk_reward": round(rr, 2),
         "haltedauer": hold,
         "fundamental": "⚠️ Rein technisches Signal — keine News-/Fundamentalanalyse. "
@@ -402,8 +479,18 @@ def format_signal(pair: str, s: dict, htf: dict | None) -> str:
     tp_pips = pips_between(pair, entry, tp)
     is_long = s["direction"] == "long"
     arrow = "🟢 KAUFEN (Buy Limit)" if is_long else "🔴 VERKAUFEN (Sell Limit)"
-    digits = 3 if "JPY" in pair else 5
+    digits = 3 if ("JPY" in pair or pair.startswith("XAU")) else 5
     htf_line = f"\n📐 {HTF_INTERVAL}-Trend: {htf['trend']}" if htf else ""
+
+    # Take-Profit-Zeilen (mehrere Stufen)
+    tps = s.get("take_profits") or [s["take_profit"]]
+    tp_lines = ""
+    for i, t in enumerate(tps, 1):
+        tp_lines += f"✅ TP{i}: {t:.{digits}f}  ({pips_between(pair, entry, t):.0f} Pips)\n"
+
+    # Confidence-skalierter Lot-Vorschlag (gesamt, wird auf die TPs aufgeteilt)
+    lots, risk_pct, capped = suggest_lot(s["confidence"], sl_pips, pair, entry)
+    cap_note = " (gedeckelt)" if capped else ""
 
     return (
         f"📊 FOREX SIGNAL — {pair}\n"
@@ -411,19 +498,19 @@ def format_signal(pair: str, s: dict, htf: dict | None) -> str:
         f"{arrow}\n"
         f"🎯 Entry: {entry:.{digits}f}\n"
         f"🛑 Stop Loss: {sl:.{digits}f}  ({sl_pips:.0f} Pips)\n"
-        f"✅ Take Profit: {tp:.{digits}f}  ({tp_pips:.0f} Pips)\n"
-        f"⚖️ Chance/Risiko: 1:{s['risk_reward']:.1f}\n"
+        f"{tp_lines}"
+        f"⚖️ Chance/Risiko (TP1): 1:{s['risk_reward']:.1f}\n"
         f"⏳ Erwartete Haltedauer: {s.get('haltedauer', 'wenige Stunden')}\n"
         f"🎰 Confidence: {s['confidence']:.0f}/100"
         f"{htf_line}\n"
         f"🕐 Session: {current_session()}\n"
-        f"\n📰 FUNDAMENTAL\n{s.get('fundamental','-')}\n"
-        f"\n👥 SENTIMENT\n{s.get('sentiment','-')}\n"
+        f"\n💰 LOT-VORSCHLAG: {lots:.2f} Lots{cap_note}\n"
+        f"   (Confidence {s['confidence']:.0f} → {risk_pct:.2f}% Risiko von {ACCOUNT_SIZE:,.0f})\n"
+        f"   aufgeteilt auf {len(tps)} Teil-Trades (je {lots/len(tps):.2f})\n"
         f"\n💡 BEGRÜNDUNG\n{s.get('reasoning','-')}\n"
+        f"{s.get('fundamental','')}\n"
         f"══════════════════════\n"
-        f"💰 Positionsgröße? → /lot\n"
-        f"⚠️ Kein Finanzrat. Prüfe selbst & nutze Risikomanagement.\n"
-        f"💬 Fragen? Schreib mir!"
+        f"⚠️ Kein Finanzrat. Prüfe selbst & nutze Risikomanagement."
     )
 
 # ═══════════════════════════════════════════════════════════════
@@ -518,8 +605,12 @@ async def scan(bot: Bot):
         # ── Stufe 3: Signal-Erzeugung (beste zuerst) ──
         aligned.sort(key=lambda x: x[3], reverse=True)
         ai_calls = 0
+        sent_this_scan = 0
         for pair, direction, a, score, htf in aligned:
             if signals_today["count"] >= MAX_SIGNALS_DAY:
+                break
+            if sent_this_scan >= MAX_SIGNALS_PER_SCAN:
+                print(f"  Max {MAX_SIGNALS_PER_SCAN} Signale/Scan erreicht — Rest beim nächsten Scan.")
                 break
 
             if USE_AI_ANALYSIS:
@@ -557,9 +648,10 @@ async def scan(bot: Bot):
                 scan_stats["rejections"].append(f"{pair}: R:R {s['risk_reward']}")
                 print(f"    abgelehnt (R:R {s['risk_reward']})")
                 continue
-            # ── Signal senden ──
-            await tg_send(bot, format_signal(pair, s, htf))
+            # ── Signal senden (mit Trading-Buttons, falls OANDA aktiv) ──
+            await send_signal_with_buttons(bot, pair, s, htf)
             signals_today["count"] += 1
+            sent_this_scan += 1
             last_signal_time[pair] = datetime.now().isoformat()
             scan_stats["signals_this_run"].append(f"{pair} {direction.upper()}")
             save_state()
@@ -615,6 +707,242 @@ def ai_chat(user_msg: str, deep: bool = False) -> str:
         return f"❌ KI nicht erreichbar: {e}"
 
 # ═══════════════════════════════════════════════════════════════
+#  OANDA-TRADING (Demo standardmäßig) + Button-Flow
+# ═══════════════════════════════════════════════════════════════
+pending_trades: dict = {}        # short_id -> Trade-Parameter (für Accept-Button)
+awaiting_lot: dict = {}          # chat_id -> short_id (Nutzer gibt gleich Lot ein)
+_trade_counter = 0
+
+def oanda_instrument(pair: str) -> str:
+    """EUR/USD -> EUR_USD (OANDA-Format)."""
+    return pair.replace("/", "_")
+
+def oanda_configured() -> bool:
+    return bool(OANDA_TOKEN and OANDA_ACCOUNT_ID)
+
+def oanda_place_order(instrument: str, units: int, entry: float, sl: float,
+                      tp: float, digits: int) -> dict:
+    """
+    Platziert eine LIMIT-Order auf dem (Demo-)Konto mit SL & TP.
+    units: positiv = Buy, negativ = Sell. Gibt {ok, id/err} zurück.
+    """
+    url = f"{OANDA_BASE}/v3/accounts/{OANDA_ACCOUNT_ID}/orders"
+    headers = {"Authorization": f"Bearer {OANDA_TOKEN}", "Content-Type": "application/json"}
+    body = {"order": {
+        "type": "LIMIT",
+        "instrument": instrument,
+        "units": str(int(units)),
+        "price": f"{entry:.{digits}f}",
+        "timeInForce": "GTC",
+        "positionFill": "DEFAULT",
+        "stopLossOnFill": {"price": f"{sl:.{digits}f}", "timeInForce": "GTC"},
+        "takeProfitOnFill": {"price": f"{tp:.{digits}f}"},
+    }}
+    try:
+        r = requests.post(url, headers=headers, json=body, timeout=15)
+        data = r.json()
+        if r.status_code in (200, 201) and ("orderCreateTransaction" in data
+                                            or "orderFillTransaction" in data):
+            txid = (data.get("orderCreateTransaction", {}) or {}).get("id", "?")
+            return {"ok": True, "id": txid}
+        # OANDA liefert Fehlerdetails
+        msg = data.get("errorMessage") or data.get("orderRejectTransaction", {}).get("reason") or str(data)[:200]
+        return {"ok": False, "err": msg}
+    except Exception as e:
+        return {"ok": False, "err": str(e)}
+
+def execute_trade_oanda(t: dict) -> str:
+    """Öffnet pro Take-Profit eine Teil-Order (Ausskalieren) über OANDA."""
+    pair = t["pair"]
+    instrument = oanda_instrument(pair)
+    digits = 3 if ("JPY" in pair or pair.startswith("XAU")) else 5
+    tps = t["take_profits"]
+    total_units = t["lots"] * 100000
+    if t["direction"] == "short":
+        total_units = -total_units
+    per = int(round(total_units / len(tps)))
+    if per == 0:
+        return "❌ Lot zu klein für eine Teilung auf mehrere TPs. Erhöhe die Lot."
+
+    lines, ok_count = [], 0
+    for i, tp in enumerate(tps, 1):
+        res = oanda_place_order(instrument, per, t["entry"], t["stop_loss"], tp, digits)
+        if res["ok"]:
+            ok_count += 1
+            lines.append(f"  ✅ Teil-Trade {i}/{len(tps)} → TP{i} (Order {res['id']})")
+        else:
+            lines.append(f"  ❌ Teil-Trade {i}: {res['err']}")
+    head = (f"📈 {pair} {t['direction'].upper()} — {ok_count}/{len(tps)} Orders platziert "
+            f"({OANDA_ENV})\n")
+    return head + "\n".join(lines)
+
+# ─── Capital.com ───
+CAPITAL_EPICS = {"XAU/USD": "GOLD", "XAG/USD": "SILVER"}
+
+def capital_configured() -> bool:
+    return bool(CAPITAL_API_KEY and CAPITAL_IDENTIFIER and CAPITAL_PASSWORD)
+
+def capital_epic(pair: str) -> str:
+    """EUR/USD -> EURUSD, XAU/USD -> GOLD."""
+    return CAPITAL_EPICS.get(pair, pair.replace("/", ""))
+
+def capital_digits(pair: str) -> int:
+    if pair.startswith("XAU"): return 2
+    if "JPY" in pair: return 3
+    return 5
+
+def capital_login():
+    """Session erstellen → (cst, x-security-token, fehler)."""
+    url = f"{CAPITAL_BASE}/api/v1/session"
+    headers = {"X-CAP-API-KEY": CAPITAL_API_KEY, "Content-Type": "application/json"}
+    body = {"identifier": CAPITAL_IDENTIFIER, "password": CAPITAL_PASSWORD}
+    try:
+        r = requests.post(url, headers=headers, json=body, timeout=15)
+        if r.status_code != 200:
+            return None, None, f"Login fehlgeschlagen ({r.status_code}): {r.text[:150]}"
+        cst = r.headers.get("CST")
+        xsec = r.headers.get("X-SECURITY-TOKEN")
+        if not cst or not xsec:
+            return None, None, "Keine Session-Tokens erhalten (2FA aktiviert?)"
+        return cst, xsec, None
+    except Exception as e:
+        return None, None, str(e)
+
+def capital_place_order(cst, xsec, epic, direction, size, level, sl, tp, digits) -> dict:
+    """Platziert eine LIMIT-Working-Order mit SL & TP über Capital.com."""
+    url = f"{CAPITAL_BASE}/api/v1/workingorders"
+    headers = {"CST": cst, "X-SECURITY-TOKEN": xsec, "Content-Type": "application/json"}
+    body = {
+        "epic": epic,
+        "direction": direction,           # BUY oder SELL
+        "size": size,
+        "level": round(level, digits),
+        "type": "LIMIT",
+        "stopLevel": round(sl, digits),
+        "profitLevel": round(tp, digits),
+        "guaranteedStop": False,
+    }
+    try:
+        r = requests.post(url, headers=headers, json=body, timeout=15)
+        data = r.json() if r.content else {}
+        if r.status_code in (200, 201) and data.get("dealReference"):
+            return {"ok": True, "id": data["dealReference"]}
+        msg = data.get("errorCode") or data.get("error") or r.text[:150]
+        return {"ok": False, "err": msg}
+    except Exception as e:
+        return {"ok": False, "err": str(e)}
+
+def execute_trade_capital(t: dict) -> str:
+    """Öffnet pro Take-Profit eine Teil-Order über Capital.com."""
+    cst, xsec, err = capital_login()
+    if err:
+        return f"❌ Capital.com Login fehlgeschlagen: {err}"
+    pair = t["pair"]
+    epic = capital_epic(pair)
+    digits = capital_digits(pair)
+    direction = "BUY" if t["direction"] == "long" else "SELL"
+    tps = t["take_profits"]
+    total = t["lots"] * CAPITAL_SIZE_FACTOR
+    per = round(total / len(tps), 2)
+    if per <= 0:
+        return "❌ Size zu klein. Erhöhe die Lot oder CAPITAL_SIZE_FACTOR."
+
+    lines, ok_count = [], 0
+    for i, tp in enumerate(tps, 1):
+        res = capital_place_order(cst, xsec, epic, direction, per, t["entry"],
+                                  t["stop_loss"], tp, digits)
+        if res["ok"]:
+            ok_count += 1
+            lines.append(f"  ✅ Teil-Order {i}/{len(tps)} → TP{i} (Ref {res['id'][:12]})")
+        else:
+            lines.append(f"  ❌ Teil-Order {i}: {res['err']}")
+    head = (f"📈 {pair} {direction} ({epic}) — {ok_count}/{len(tps)} Orders ({CAPITAL_ENV}), "
+            f"Size je {per}\n")
+    tail = ("\n\n⚠️ Prüfe in der Capital.com-App, ob die Größe stimmt! Falls zu klein/groß: "
+            "Lot per Button ändern oder CAPITAL_SIZE_FACTOR anpassen." if ok_count else "")
+    return head + "\n".join(lines) + tail
+
+def broker_configured() -> bool:
+    return capital_configured() if BROKER == "capital" else oanda_configured()
+
+def broker_env_label() -> str:
+    return CAPITAL_ENV if BROKER == "capital" else OANDA_ENV
+
+def execute_trade(t: dict) -> str:
+    """Dispatcht an den gewählten Broker."""
+    if BROKER == "capital":
+        return execute_trade_capital(t)
+    return execute_trade_oanda(t)
+
+
+def trade_buttons(sid: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Accept", callback_data=f"acc:{sid}"),
+         InlineKeyboardButton("❌ Decline", callback_data=f"dec:{sid}")],
+        [InlineKeyboardButton("✏️ LOT bearbeiten", callback_data=f"lot:{sid}")],
+    ])
+
+async def send_signal_with_buttons(bot: Bot, pair: str, s: dict, htf: dict | None):
+    """Sendet das Signal. Mit Trading-Buttons, wenn OANDA konfiguriert; sonst nur Text."""
+    global _trade_counter
+    text = format_signal(pair, s, htf)
+    if not (TRADING_ENABLED and broker_configured()):
+        await tg_send(bot, text)
+        return
+    _trade_counter += 1
+    sid = str(_trade_counter)
+    sl_pips = pips_between(pair, s["entry"], s["stop_loss"])
+    lots, _, _ = suggest_lot(s["confidence"], sl_pips, pair, s["entry"])
+    pending_trades[sid] = {
+        "pair": pair, "direction": s["direction"], "entry": s["entry"],
+        "stop_loss": s["stop_loss"], "take_profits": s["take_profits"], "lots": lots,
+    }
+    if not TELEGRAM_CHAT_ID:
+        await tg_send(bot, text)
+        return
+    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text + "\n\n👇 Was tun?",
+                           reply_markup=trade_buttons(sid))
+
+async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Verarbeitet Accept / Decline / LOT bearbeiten."""
+    q = update.callback_query
+    await q.answer()
+    try:
+        action, sid = q.data.split(":", 1)
+    except ValueError:
+        return
+    t = pending_trades.get(sid)
+    if not t:
+        await q.edit_message_reply_markup(reply_markup=None)
+        await q.message.reply_text("⚠️ Dieses Signal ist abgelaufen (Bot wurde evtl. neu gestartet).")
+        return
+
+    if action == "dec":
+        pending_trades.pop(sid, None)
+        await q.edit_message_reply_markup(reply_markup=None)
+        await q.message.reply_text(f"❌ {t['pair']} verworfen.")
+        return
+
+    if action == "lot":
+        awaiting_lot[q.message.chat_id] = sid
+        await q.message.reply_text(
+            f"✏️ Sende mir jetzt die gewünschte Lot-Größe für {t['pair']} "
+            f"(aktuell {t['lots']:.2f}). Beispiel: 0.5")
+        return
+
+    if action == "acc":
+        if not (TRADING_ENABLED and broker_configured()):
+            await q.message.reply_text(
+                f"⚠️ Trading ist nicht aktiv. Setze die {BROKER.capitalize()}-Variablen "
+                f"und TRADING_ENABLED=true in Railway.")
+            return
+        await q.edit_message_reply_markup(reply_markup=None)
+        await q.message.reply_text(f"⏳ Platziere Orders für {t['pair']} ({broker_env_label()})...")
+        status = await asyncio.to_thread(execute_trade, t)
+        pending_trades.pop(sid, None)
+        await q.message.reply_text(status)
+
+# ═══════════════════════════════════════════════════════════════
 #  TELEGRAM HANDLERS
 # ═══════════════════════════════════════════════════════════════
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -646,12 +974,23 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     reset_daily_if_needed()
     mo = "🟢 offen" if market_open() else "🔴 geschlossen"
+    env = broker_env_label()
+    is_demo = env in ("demo", "practice")
+    if not broker_configured():
+        trade_mode = f"❌ aus (kein {BROKER.capitalize()})"
+    elif not TRADING_ENABLED:
+        trade_mode = "❌ aus (TRADING_ENABLED=false)"
+    else:
+        trade_mode = f"✅ AN über {BROKER.capitalize()} — {'🟡 DEMO' if is_demo else '🔴 LIVE/ECHT'}"
+    analyse = "KI (Sonnet+Suche)" if USE_AI_ANALYSIS else "Technik (kostenlos)"
     await update.message.reply_text(
-        f"📊 Status (Opus 4.8)\nMarkt: {mo}\n"
+        f"📊 Status\nMarkt: {mo}\n"
         f"🕐 Session: {current_session()}\n"
+        f"Analyse: {analyse}\n"
         f"Signale heute: {signals_today['count']}/{MAX_SIGNALS_DAY}\n"
-        f"Überwachte Paare: {len(PAIRS)}\n"
-        f"Confidence-Schwelle: {CONFIDENCE_MIN}/100 | Min R:R 1:{MIN_RR}")
+        f"Überwachte Paare: {len(PAIRS)} | Chart {INTERVAL}, HTF {HTF_INTERVAL}\n"
+        f"Confidence-Schwelle: {CONFIDENCE_MIN}/100 | Min R:R 1:{MIN_RR}\n"
+        f"💹 Trading: {trade_mode}")
 
 async def cmd_pairs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Überwachte Major-Paare:\n" + "\n".join(f"• {p}" for p in PAIRS))
@@ -714,19 +1053,38 @@ async def cmd_lot(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lots = risk_amount / (sl_pips * pip_val_lot)
     units = lots * 100000
 
+    # Positionswert (Notional) grob in Kontowährung + impliziter Hebel
+    if pair.endswith("USD"):
+        notional = units                       # z.B. EUR/USD: units in Basis ≈ Wert
+    elif pair.startswith("XAU"):
+        notional = units                       # grob
+    else:
+        notional = units                       # Näherung
+    leverage = notional / account if account > 0 else 0
+
+    lev_warn = ""
+    if leverage > 10:
+        lev_warn = f"\n⚠️ Hoher Hebel ({leverage:.0f}×)! Erwäge weniger Risiko-% oder einen weiteren Stop."
+
     note = ""
     if pair.startswith(("XAU", "XAG")):
-        note = "\n⚠️ Metalle: Lot-Konventionen variieren stark je Broker — hier nur grobe Orientierung."
+        note = "\nℹ️ Metalle: Lot-Konventionen variieren je Broker — nur grobe Orientierung."
 
     await update.message.reply_text(
         f"💰 POSITIONSGRÖSSE — {pair}\n"
         f"══════════════════════\n"
-        f"Konto: {account:.0f} | Risiko: {risk_pct:.1f}% = {risk_amount:.2f}\n"
-        f"Stop: {sl_pips:.0f} Pips\n\n"
+        f"Konto: {account:,.0f} | Risiko: {risk_pct:.1f}% = {risk_amount:,.0f}\n"
+        f"Stop-Loss: {sl_pips:.0f} Pips\n\n"
         f"➡️ {lots:.2f} Lots\n"
-        f"➡️ {units:,.0f} Einheiten\n"
-        f"➡️ Mikrolots: {lots*100:.0f}\n\n"
-        f"Bei SL-Hit verlierst du genau {risk_amount:.2f} (≈{risk_pct:.1f}%).\n"
+        f"   = {lots*10:.1f} Mini-Lots\n"
+        f"   = {lots*100:.0f} Mikro-Lots\n"
+        f"   = {units:,.0f} Einheiten\n\n"
+        f"📊 Positionswert: ~{notional:,.0f} ({leverage:.1f}× Hebel aufs Konto)\n"
+        f"💸 Verlust bei SL-Hit: ~{risk_amount:,.0f} ({risk_pct:.1f}%)"
+        f"{lev_warn}\n\n"
+        f"ℹ️ \"Lot\" = Positionsgröße, NICHT dein Risiko. 1 Lot = 100.000 Einheiten "
+        f"(~10$/Pip). Dein echtes Risiko = Lots × Pip-Wert × Stop. Ein enger Stop "
+        f"erlaubt mehr Lots bei gleichem Risiko, erhöht aber den Hebel.\n"
         f"⚠️ Näherung; je nach Broker/Kontowährung leicht abweichend.{note}")
 
 async def cmd_deep(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -748,6 +1106,27 @@ async def cmd_deep(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message.text
+    chat_id = update.message.chat_id
+
+    # Wartet der Nutzer gerade auf Lot-Eingabe für ein Signal?
+    if chat_id in awaiting_lot:
+        sid = awaiting_lot.pop(chat_id)
+        t = pending_trades.get(sid)
+        new_lot = safe_float(msg.replace(",", "."))
+        if not t:
+            await update.message.reply_text("⚠️ Signal ist abgelaufen.")
+            return
+        if new_lot is None or new_lot <= 0:
+            awaiting_lot[chat_id] = sid  # nochmal versuchen
+            await update.message.reply_text("❌ Ungültig. Schick eine Zahl, z.B. 0.5")
+            return
+        t["lots"] = round(new_lot, 2)
+        await update.message.reply_text(
+            f"✏️ Lot für {t['pair']} auf {t['lots']:.2f} gesetzt "
+            f"(aufgeteilt auf {len(t['take_profits'])} Teil-Trades je {t['lots']/len(t['take_profits']):.2f}).",
+            reply_markup=trade_buttons(sid))
+        return
+
     thinking = await update.message.reply_text("🤔 Recherchiere...")
     answer = await asyncio.to_thread(ai_chat, msg)
     try:
@@ -799,6 +1178,7 @@ async def main():
     app.add_handler(CommandHandler("today", cmd_today))
     app.add_handler(CommandHandler("lot", cmd_lot))
     app.add_handler(CommandHandler("deep", cmd_deep))
+    app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     await app.initialize()
