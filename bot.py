@@ -74,6 +74,7 @@ CAPITAL_IDENTIFIER = os.getenv("CAPITAL_IDENTIFIER", "")     # Login/E-Mail
 CAPITAL_PASSWORD   = os.getenv("CAPITAL_PASSWORD", "")       # das CUSTOM-Passwort des API-Keys
 CAPITAL_ENV        = os.getenv("CAPITAL_ENV", "demo")        # demo oder live
 CAPITAL_SIZE_FACTOR = float(os.getenv("CAPITAL_SIZE_FACTOR", "1.0"))  # Lot -> Capital-Size kalibrieren
+CAPITAL_MIN_SIZE    = float(os.getenv("CAPITAL_MIN_SIZE", "0"))       # manueller Mindestgrößen-Override
 CAPITAL_BASE = ("https://demo-api-capital.backend-capital.com" if CAPITAL_ENV == "demo"
                 else "https://api-capital.backend-capital.com")
 TD_MIN_GAP        = 8.0         # min. Sekunden zwischen Twelve-Data-Calls (≈8/min)
@@ -832,8 +833,41 @@ def capital_place_order(cst, xsec, epic, direction, size, level, sl, tp, digits)
     except Exception as e:
         return {"ok": False, "err": str(e)}
 
+def capital_min_size(cst, xsec, epic) -> float | None:
+    """Fragt die minimale Deal-Größe für ein Instrument ab (Capital.com)."""
+    url = f"{CAPITAL_BASE}/api/v1/markets/{epic}"
+    headers = {"CST": cst, "X-SECURITY-TOKEN": xsec, "Content-Type": "application/json"}
+    try:
+        r = requests.get(url, headers=headers, timeout=15)
+        if r.status_code == 200:
+            rules = (r.json() or {}).get("dealingRules", {}) or {}
+            v = (rules.get("minDealSize", {}) or {}).get("value")
+            return float(v) if v is not None else None
+    except Exception:
+        pass
+    return None
+
+def capital_place_order_grow(cst, xsec, epic, direction, size, level, sl, tp, digits) -> dict:
+    """
+    Platziert eine Order und VERGRÖSSERT die Size automatisch, falls Capital sie
+    als zu klein ablehnt (error.invalid.size.minvalue). So trifft sie immer das Minimum.
+    """
+    s = max(float(size), 0.01)
+    last = ""
+    for _ in range(9):                       # 0.01 → ... → bis akzeptiert (max ~×256)
+        res = capital_place_order(cst, xsec, epic, direction, round(s, 2), level, sl, tp, digits)
+        if res["ok"]:
+            res["size"] = round(s, 2)
+            return res
+        last = str(res.get("err", "")).lower()
+        if "minvalue" in last or ("min" in last and "size" in last):
+            s = s * 2 if s > 0 else 1.0      # zu klein → verdoppeln und erneut
+            continue
+        return res                            # anderer Fehler → abbrechen
+    return {"ok": False, "err": last}
+
 def execute_trade_capital(t: dict) -> str:
-    """Öffnet pro Take-Profit eine Teil-Order über Capital.com."""
+    """Öffnet pro Take-Profit eine Teil-Order über Capital.com — direkt in Capital-Size."""
     cst, xsec, err = capital_login()
     if err:
         return f"❌ Capital.com Login fehlgeschlagen: {err}"
@@ -842,25 +876,37 @@ def execute_trade_capital(t: dict) -> str:
     digits = capital_digits(pair)
     direction = "BUY" if t["direction"] == "long" else "SELL"
     tps = t["take_profits"]
+
+    # Gewünschte Gesamt-Größe (in Capital-Size, KEIN Lot mehr)
     total = t["lots"] * CAPITAL_SIZE_FACTOR
     per = round(total / len(tps), 2)
-    if per <= 0:
-        return "❌ Size zu klein. Erhöhe die Lot oder CAPITAL_SIZE_FACTOR."
+    # Falls bekannt, schon mal aufs Broker-Minimum heben (spart Versuche); sonst regelt Auto-Grow
+    min_size = capital_min_size(cst, xsec, epic) or CAPITAL_MIN_SIZE
+    if min_size and per < min_size:
+        per = min_size
+    per = max(per, 0.01)
 
-    lines, ok_count = [], 0
+    lines, ok_count, used = [], 0, None
     for i, tp in enumerate(tps, 1):
-        res = capital_place_order(cst, xsec, epic, direction, per, t["entry"],
-                                  t["stop_loss"], tp, digits)
+        start = used if used else per          # nach 1. Treffer gleiche Size weiterverwenden
+        res = capital_place_order_grow(cst, xsec, epic, direction, start,
+                                       t["entry"], t["stop_loss"], tp, digits)
         if res["ok"]:
             ok_count += 1
-            lines.append(f"  ✅ Teil-Order {i}/{len(tps)} → TP{i} (Ref {res['id'][:12]})")
+            used = res["size"]
+            lines.append(f"  ✅ Teil-Order {i}/{len(tps)} → TP{i} | Size {res['size']} (Ref {res['id'][:10]})")
         else:
             lines.append(f"  ❌ Teil-Order {i}: {res['err']}")
-    head = (f"📈 {pair} {direction} ({epic}) — {ok_count}/{len(tps)} Orders ({CAPITAL_ENV}), "
-            f"Size je {per}\n")
-    tail = ("\n\n⚠️ Prüfe in der Capital.com-App, ob die Größe stimmt! Falls zu klein/groß: "
-            "Lot per Button ändern oder CAPITAL_SIZE_FACTOR anpassen." if ok_count else "")
-    return head + "\n".join(lines) + tail
+
+    head = (f"📈 {pair} {direction} ({epic}) — {ok_count}/{len(tps)} Orders ({CAPITAL_ENV})\n")
+    note = ""
+    if ok_count and used and used > per + 0.001:
+        note = (f"\n\nℹ️ Größe automatisch auf {used} angehoben (Capital-Mindestgröße). "
+                f"Größer/kleiner? Größe per Button ändern oder CAPITAL_SIZE_FACTOR setzen.")
+    elif ok_count:
+        note = "\n\n⚠️ Prüfe in der Capital.com-App, ob die Größe passt (Button/CAPITAL_SIZE_FACTOR)."
+    return head + "\n".join(lines) + note
+
 
 def broker_configured() -> bool:
     return capital_configured() if BROKER == "capital" else oanda_configured()
