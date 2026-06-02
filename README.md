@@ -1,40 +1,44 @@
-# 📊 Forex Signal Bot (Opus 4.8)
+# 📊 Forex Scalping Signal Bot (kostenlose Engine)
 
-Hochselektiver Forex-Daytrading-Bot für die 7 Major-Paare. Schickt max. 2-3 Signale/Tag
-— aber nur solche mit hoher Confidence. Stop-Loss und Take-Profit werden aus echter
-Marktstruktur (ATR + Swing-Levels) berechnet und von Opus 4.8 mit Live-Recherche begründet.
+Schneller Forex-Scalping-Bot für 10 liquide Paare. Signale entstehen aus einer
+kostenlosen technischen Engine — kein KI-Aufruf pro Signal, also keine laufenden Kosten.
 
 ## Wie es funktioniert
-1. Lädt 1h-Kursdaten (Twelve Data) für EUR/USD, GBP/USD, USD/JPY, USD/CHF, AUD/USD, USD/CAD, NZD/USD
-2. Berechnet lokal Indikatoren: EMA(20/50/200), RSI, MACD, ATR, Bollinger, Swing-Levels
-3. Technischer Vorab-Filter → nur starke Setups gehen weiter
-4. Opus 4.8 recherchiert live: Fundamental (Notenbanken, News, Kalender) + Sentiment (COT, Retail)
-5. Opus bestimmt Entry/SL/TP aus echten Levels und vergibt eine Confidence
-6. Nur Signale mit Confidence ≥ 75 und Chance/Risiko ≥ 1:1.5 werden gesendet
+1. Lädt 15min-Kursdaten (Twelve Data) für 10 liquide Paare (Majors + EUR/JPY, GBP/JPY, Gold)
+2. Berechnet lokal: EMA(20/50/200), RSI, MACD, ATR, ADX, Bollinger, Swing-Levels
+3. Technischer Vorfilter inkl. ADX-Trendstärke-Gate (kein Signal in Seitwärtsphasen)
+4. 1h-Multi-Timeframe-Check (nur für Top-Kandidaten → spart Daten-Credits)
+5. Technische Engine erzeugt Entry/SL/TP: Pullback-Entry, ATR-Stop (volatilitätsadaptiv,
+   kein fester %), Swing-Level- oder 2R-Ziel, Confidence aus Confluence
+6. Nur Signale mit Confidence ≥ 70 und Chance/Risiko ≥ 1:1.5
+7. Sofort-Meldung nach jedem Scan mit Aktivität (kein /today nötig)
 
-## Setup
-### 1. Neuer Telegram Bot
-@BotFather → /newbot → Token. Bot öffnen → /start → Chat-ID merken.
-### 2. Anthropic API Key
-console.anthropic.com → API Keys.
-### 3. Twelve Data API Key (kostenlos)
-twelvedata.com → Sign up → API Key kopieren (Free: 800 Calls/Tag, reicht).
-### 4. Railway Environment Variables
+## Kosten
+- **Scans: 0 €** (rein technisch, nur gratis Twelve-Data-Abrufe)
+- **Chat-Fragen**: Sonnet 4.6 (günstig), nur auf deine Frage hin
+- **/deep <frage>**: Opus 4.8 Premium-Recherche, nur auf Abruf
+- Optional zurück auf KI-Signalanalyse: Variable `USE_AI_ANALYSIS=true`
+
+## Setup (Railway Variables)
 | Variable | Wert |
 |---|---|
 | TELEGRAM_TOKEN | von BotFather |
 | TELEGRAM_CHAT_ID | von /start |
-| ANTHROPIC_API_KEY | console.anthropic.com |
-| TWELVE_DATA_KEY | twelvedata.com |
-| AI_MODEL | claude-opus-4-8 (optional) |
+| ANTHROPIC_API_KEY | console.anthropic.com (nur für Chat/Deep) |
+| TWELVE_DATA_KEY | twelvedata.com (gratis) |
+
+Optionale Variablen: PAIRS, INTERVAL, CONFIDENCE_MIN, MAX_SIGNALS_DAY, USE_AI_ANALYSIS
 
 ## Befehle
-/status — Tageszähler & Marktstatus
-/scan — sofort scannen (nicht aufs Intervall warten)
+/status — Markt, Session, Schwellen
+/scan — sofort scannen (meldet Ergebnis direkt)
+/today — Tagesübersicht
+/lot — Positionsgröße aus Risiko berechnen
+/deep <frage> — Premium-Recherche über Opus 4.8
 /pairs — überwachte Paare
-/help — Erklärung
-Freitext → Opus 4.8 beantwortet Marktfragen mit Live-Recherche
+Freitext → Antwort über Sonnet 4.6
 
 ## ⚠️ Disclaimer
-Kein Finanzrat. Forex-Trading ist hochriskant. Signale sind gut recherchierte Vorschläge,
-keine Garantie. Triff jede Entscheidung selbst und nutze striktes Risikomanagement.
+Kein Finanzrat. Forex-Scalping ist hochriskant. Das Bot-Signal ist rein technisch und
+berücksichtigt keine News — prüfe den Wirtschaftskalender selbst. Triff jede Entscheidung
+selbst und riskiere pro Trade nur 1-2% deines Kapitals.
