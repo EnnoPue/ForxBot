@@ -24,32 +24,30 @@ AI_MODEL_SIGNAL  = os.getenv("AI_MODEL_SIGNAL", "claude-sonnet-4-6")  # Signal-A
 AI_MODEL_CHAT    = os.getenv("AI_MODEL_CHAT", "claude-sonnet-4-6")     # Chat-Fragen (günstig)
 AI_MODEL_DEEP    = os.getenv("AI_MODEL_DEEP", "claude-opus-4-8")       # /deep Premium-Recherche
 
-# 7 Majors + die meistgehandelten zusätzlichen Paare (inkl. Gold).
-# Bewusst kompakt gehalten, damit der 1h-Scan im Twelve-Data-Free-Tier bleibt.
-# Über die Variable PAIRS frei überschreibbar.
+# Scalping: kostenlose technische Analyse (Standard). USE_AI_ANALYSIS=true schaltet
+# wieder auf die kostenpflichtige KI-Analyse mit Websuche um.
+USE_AI_ANALYSIS  = os.getenv("USE_AI_ANALYSIS", "false").lower() == "true"
+
+# Da die Analyse kostenlos ist, etwas mehr liquide Paare (Daten-Limit Twelve Data bleibt der Engpass).
 DEFAULT_PAIRS = [
-    # Majors
     "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF", "AUD/USD", "USD/CAD", "NZD/USD",
-    # Größte/meistgehandelte zusätzliche Paare
-    "EUR/JPY", "GBP/JPY", "EUR/GBP", "EUR/CHF", "AUD/JPY", "EUR/AUD",
-    "GBP/CHF", "CAD/JPY",
-    # Gold (sehr hohes Volumen)
-    "XAU/USD",
+    "EUR/JPY", "GBP/JPY", "XAU/USD",
 ]
 _pairs_env = os.getenv("PAIRS", "").strip()
 PAIRS = ([p.strip().upper() for p in _pairs_env.split(",") if p.strip()]
          if _pairs_env else DEFAULT_PAIRS)
 
-INTERVAL          = os.getenv("INTERVAL", "30min")   # Daytrading-Zeitfenster (kürzer = mehr Setups)
-HTF_INTERVAL      = "4h"        # übergeordneter Trend für Multi-Timeframe
-PRESCREEN_MIN     = 58          # Technischer Vorab-Filter
-CONFIDENCE_MIN    = int(os.getenv("CONFIDENCE_MIN", "73"))  # KI-Confidence-Schwelle
-MAX_SIGNALS_DAY   = int(os.getenv("MAX_SIGNALS_DAY", "4"))  # max. Signale pro Tag
+INTERVAL          = os.getenv("INTERVAL", "15min")   # Scalping-Zeitfenster (schnelle Trades)
+HTF_INTERVAL      = "1h"        # übergeordneter Trend (1h passt zu 15min-Scalping)
+PRESCREEN_MIN     = 55          # Technischer Vorab-Filter (etwas lockerer fürs Scalping)
+CONFIDENCE_MIN    = int(os.getenv("CONFIDENCE_MIN", "70"))  # KI-Confidence-Schwelle
+MAX_SIGNALS_DAY   = int(os.getenv("MAX_SIGNALS_DAY", "6"))  # mehr Signale beim Scalping
 MAX_AI_PER_SCAN   = 2           # max. KI-Analysen pro Scan (Kostenschutz)
 MIN_RR            = 1.5         # Mindest-Chance-Risiko-Verhältnis
-SCAN_INTERVAL_MIN = 45          # Scan-Takt (häufiger fürs Daytrading)
-SIGNAL_COOLDOWN_H = 4           # selbes Paar nicht öfter als alle 4h (nach Signal)
-ANALYSIS_COOLDOWN_H = 3         # selbes Paar nicht öfter als alle 3h von der KI analysieren
+SCAN_INTERVAL_MIN = 25          # Scan-Takt (häufig fürs Scalping)
+SIGNAL_COOLDOWN_H = 2           # selbes Paar nicht öfter als alle 2h signalisieren
+ANALYSIS_COOLDOWN_H = 2         # selbes Paar nicht öfter als alle 2h analysieren
+HTF_TOP_CANDIDATES = 3          # nur für die besten N Kandidaten den HTF-Trend laden (Credit-Schutz)
 TD_MIN_GAP        = 8.0         # min. Sekunden zwischen Twelve-Data-Calls (≈8/min)
 STATE_FILE        = "state.json"
 
@@ -152,7 +150,8 @@ chat_history: list = []
 signals_today = {"date": str(date.today()), "count": 0}
 last_signal_time: dict = {}     # pair -> ISO timestamp (nach gesendetem Signal)
 last_analysis_time: dict = {}   # pair -> ISO timestamp (nach Opus-Analyse, egal welches Ergebnis)
-scan_stats = {"last_run": None, "candidates": 0, "rejections": []}
+scan_stats = {"last_run": None, "candidates": 0, "rejections": [],
+              "signals_this_run": [], "ai_calls": 0, "summary": None, "closed_market": False}
 
 def save_state():
     try:
@@ -248,6 +247,82 @@ def pips_between(pair: str, a: float, b: float) -> float:
 # ═══════════════════════════════════════════════════════════════
 #  KI-ANALYSE  (Opus 4.8 mit Live-Websuche)
 # ═══════════════════════════════════════════════════════════════
+def build_technical_signal(pair: str, direction: str, a: dict, htf: dict | None) -> dict | None:
+    """
+    Kostenlose, deterministische Signal-Erzeugung aus den Indikatoren.
+    Entry = Pullback, Stop = ATR-basiert (volatilitätsadaptiv, kein fester %),
+    Take Profit = nächstes Swing-Level oder 2R, Confidence aus Confluence.
+    Gibt dasselbe Dict-Format wie die KI zurück (für validate_signal/format_signal).
+    """
+    price = a["price"]
+    atr   = a["atr"]
+    if atr <= 0 or price <= 0:
+        return None
+
+    risk = 1.5 * atr
+    if direction == "long":
+        entry = price - 0.3 * atr           # leichter Pullback-Einstieg
+        sl    = entry - risk
+        tp_struct = a["swing_high"]
+        rr_struct = (tp_struct - entry) / risk if risk > 0 else 0
+        tp = tp_struct if (MIN_RR <= rr_struct <= 4.0) else entry + 2.0 * risk
+    else:  # short
+        entry = price + 0.3 * atr
+        sl    = entry + risk
+        tp_struct = a["swing_low"]
+        rr_struct = (entry - tp_struct) / risk if risk > 0 else 0
+        tp = tp_struct if (MIN_RR <= rr_struct <= 4.0) else entry - 2.0 * risk
+
+    rr = abs(tp - entry) / abs(entry - sl) if entry != sl else 0
+    if rr < MIN_RR:
+        return {"trade": False}
+
+    # ── Confidence aus Confluence (0-100) ──
+    adx, rsi = a["adx"], a["rsi"]
+    hist, hist_prev = a["macd_hist"], a["macd_hist_prev"]
+    conf = 50
+    conf += 15 if adx >= 30 else 10 if adx >= 22 else 5            # Trendstärke
+    if direction == "long":
+        conf += 10 if 45 <= rsi <= 65 else 5 if 40 <= rsi < 70 else 0
+        if hist > 0 and hist > hist_prev: conf += 10               # Momentum dreht hoch
+    else:
+        conf += 10 if 35 <= rsi <= 55 else 5 if 30 < rsi <= 60 else 0
+        if hist < 0 and hist < hist_prev: conf += 10
+    aligned = htf and ((direction == "long" and htf["trend"] == "bullish")
+                       or (direction == "short" and htf["trend"] == "bearish"))
+    if aligned: conf += 15                                          # Multi-Timeframe-Bestätigung
+    if rr >= 2.5: conf += 5
+    conf = max(0, min(conf, 100))
+
+    # ── Haltedauer grob schätzen ──
+    ratio = abs(tp - entry) / atr
+    mins = ratio * 15 * 1.2
+    if mins < 60:     hold = f"~{max(15, int(round(mins/15))*15)} Min"
+    elif mins < 180:  hold = "1-3 Stunden"
+    else:             hold = "mehrere Stunden"
+
+    trend_word = "Aufwärts" if direction == "long" else "Abwärts"
+    tp_kind = "am Swing-Level" if tp == tp_struct else "bei 2R (ATR)"
+    reasoning = (f"{trend_word}trend (EMA20/50/200 gestaffelt), ADX {adx:.0f} = "
+                 f"{'starker' if adx >= 25 else 'moderater'} Trend, RSI {rsi:.0f}, "
+                 f"MACD-Momentum {'positiv' if hist > 0 else 'negativ'}"
+                 f"{', 4h bestätigt' if aligned else ''}. "
+                 f"Einstieg am Pullback, Stop 1,5×ATR (volatilitätsbasiert), Ziel {tp_kind}.")
+
+    return {
+        "trade": True,
+        "direction": direction,
+        "entry": entry, "stop_loss": sl, "take_profit": tp,
+        "confidence": conf, "risk_reward": round(rr, 2),
+        "haltedauer": hold,
+        "fundamental": "⚠️ Rein technisches Signal — keine News-/Fundamentalanalyse. "
+                       "Bitte Wirtschaftskalender selbst prüfen (z.B. vor Zinsentscheid/NFP). "
+                       "Für tiefe Recherche: /deep",
+        "sentiment": "Technisch: Trend + Momentum bestätigt (siehe Begründung).",
+        "reasoning": reasoning,
+    }
+
+
 def deep_analysis(pair: str, direction: str, a: dict, htf: dict | None) -> dict | None:
     """
     Lässt Opus 4.8 eine Confluence-Analyse machen:
@@ -284,9 +359,11 @@ DEINE AUFGABE — recherchiere im Web (nutze die Suche aktiv):
 
 DANN entscheide:
 - Lohnt sich der Trade in Richtung {direction.upper()} wirklich? Sei streng — nur hohe Sicherheit.
+- WICHTIG — Scalping-Modus: Ziel-Haltedauer wenige Minuten bis wenige Stunden (Intraday, kein Übernacht-Halten). Lege Entry, Stop und Take Profit eng und realistisch für eine schnelle Bewegung — primär auf Basis der Technik (15min-Struktur). Recherchiere nur kurz, ob in den nächsten Stunden ein High-Impact-Event ansteht, das man meiden sollte.
 - Bestimme Entry (Buy/Sell Limit auf sinnvollem Pullback-Level, nicht einfach Marktpreis).
 - Bestimme Stop Loss aus echter Struktur: unter/über dem Swing-Level bzw. ca. 1.5×ATR vom Entry — KEIN fester Prozentsatz. Begründe.
-- Bestimme Take Profit am nächsten relevanten Widerstand/Unterstützung (Swing-Level). Das Chance-Risiko-Verhältnis MUSS mindestens {MIN_RR} sein, sonst ablehnen.
+- Bestimme Take Profit am nächsten relevanten Widerstand/Unterstützung (Swing-Level), passend zur Haltedauer. Das Chance-Risiko-Verhältnis MUSS mindestens {MIN_RR} sein, sonst ablehnen.
+- Schätze die voraussichtliche Haltedauer (z.B. "~30 Min", "1-2 Stunden", "wenige Stunden").
 - Vergib eine Confidence 0-100. Nur >= {CONFIDENCE_MIN} wird gehandelt.
 
 Bei einem LONG muss gelten: Stop Loss < Entry < Take Profit.
@@ -294,14 +371,14 @@ Bei einem SHORT muss gelten: Take Profit < Entry < Stop Loss.
 
 Antworte mit einer kurzen Analyse und am ENDE einem JSON-Block in genau diesem Format (nichts danach):
 ```json
-{{"trade": true/false, "direction": "long/short", "entry": 0.0, "stop_loss": 0.0, "take_profit": 0.0, "confidence": 0-100, "risk_reward": 0.0, "fundamental": "1-2 Sätze", "sentiment": "1-2 Sätze", "reasoning": "warum dieser Entry/SL/TP - 2-3 Sätze"}}
+{{"trade": true/false, "direction": "long/short", "entry": 0.0, "stop_loss": 0.0, "take_profit": 0.0, "confidence": 0-100, "risk_reward": 0.0, "haltedauer": "1-2 Stunden", "fundamental": "1-2 Sätze", "sentiment": "1-2 Sätze", "reasoning": "warum dieser Entry/SL/TP - 2-3 Sätze"}}
 ```"""
 
     try:
         resp = anthropic.messages.create(
             model=AI_MODEL_SIGNAL,
             max_tokens=1200,
-            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
+            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 1}],
             messages=[{"role": "user", "content": prompt}],
         )
         text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
@@ -336,6 +413,7 @@ def format_signal(pair: str, s: dict, htf: dict | None) -> str:
         f"🛑 Stop Loss: {sl:.{digits}f}  ({sl_pips:.0f} Pips)\n"
         f"✅ Take Profit: {tp:.{digits}f}  ({tp_pips:.0f} Pips)\n"
         f"⚖️ Chance/Risiko: 1:{s['risk_reward']:.1f}\n"
+        f"⏳ Erwartete Haltedauer: {s.get('haltedauer', 'wenige Stunden')}\n"
         f"🎰 Confidence: {s['confidence']:.0f}/100"
         f"{htf_line}\n"
         f"🕐 Session: {current_session()}\n"
@@ -387,16 +465,21 @@ async def scan(bot: Bot):
         scan_stats["last_run"] = datetime.now().isoformat()
         scan_stats["candidates"] = 0
         scan_stats["rejections"] = []
+        scan_stats["signals_this_run"] = []
+        scan_stats["closed_market"] = False
 
         if signals_today["count"] >= MAX_SIGNALS_DAY:
             print(f"[{datetime.now():%H:%M}] Tageslimit ({MAX_SIGNALS_DAY}) erreicht.")
+            scan_stats["summary"] = f"🔍 Scan: Tageslimit ({MAX_SIGNALS_DAY} Signale) erreicht. Morgen geht's weiter."
             return
         if not market_open():
             print(f"[{datetime.now():%H:%M}] Markt geschlossen.")
+            scan_stats["closed_market"] = True
+            scan_stats["summary"] = "🔍 Markt geschlossen (Wochenende) — keine Analyse."
             return
 
         print(f"\n[{datetime.now():%H:%M}] 🔍 Scan {len(PAIRS)} Paare | Session: {current_session()}")
-        # ── Stufe 1: technischer Vorfilter (1h) ──
+        # ── Stufe 1: technischer Vorfilter ({INTERVAL}) ──
         candidates = []
         for pair in PAIRS:
             if not cooldown_ok(pair):
@@ -406,45 +489,57 @@ async def scan(bot: Bot):
                 continue
             a = ind.analyze(df)
             score, direction = ind.prescreen_score(a)
-            print(f"  {pair}: 1h-prescreen {score}/100 ({direction}, ADX {a['adx']:.0f})")
+            print(f"  {pair}: {INTERVAL}-prescreen {score}/100 ({direction}, ADX {a['adx']:.0f})")
             if score >= PRESCREEN_MIN and direction != "none":
                 candidates.append((pair, direction, a, score))
 
-        # ── Stufe 2: 4h-Multi-Timeframe-Filter ──
+        # Nur die besten Kandidaten weiterverfolgen (HTF-Fetch + KI = Credits/Kosten sparen)
+        candidates.sort(key=lambda x: x[3], reverse=True)
+        candidates = candidates[:HTF_TOP_CANDIDATES]
+
+        # ── Stufe 2: {HTF_INTERVAL}-Multi-Timeframe-Filter (nur Top-Kandidaten) ──
         aligned = []
         for pair, direction, a, score in candidates:
             htf = await asyncio.to_thread(htf_trend, pair)
             if htf:
                 # Konflikt mit höherem Zeitfenster → raus
                 if direction == "long" and htf["trend"] == "bearish":
-                    print(f"  {pair}: verworfen — 1h long vs. 4h bearish")
-                    scan_stats["rejections"].append(f"{pair}: 4h-Konflikt")
+                    print(f"  {pair}: verworfen — {INTERVAL} long vs. {HTF_INTERVAL} bearish")
+                    scan_stats["rejections"].append(f"{pair}: {HTF_INTERVAL}-Konflikt")
                     continue
                 if direction == "short" and htf["trend"] == "bullish":
-                    print(f"  {pair}: verworfen — 1h short vs. 4h bullish")
-                    scan_stats["rejections"].append(f"{pair}: 4h-Konflikt")
+                    print(f"  {pair}: verworfen — {INTERVAL} short vs. {HTF_INTERVAL} bullish")
+                    scan_stats["rejections"].append(f"{pair}: {HTF_INTERVAL}-Konflikt")
                     continue
             aligned.append((pair, direction, a, score, htf))
 
         scan_stats["candidates"] = len(aligned)
 
-        # ── Stufe 3: KI-Tiefenanalyse (beste zuerst) ──
+        # ── Stufe 3: Signal-Erzeugung (beste zuerst) ──
         aligned.sort(key=lambda x: x[3], reverse=True)
         ai_calls = 0
         for pair, direction, a, score, htf in aligned:
             if signals_today["count"] >= MAX_SIGNALS_DAY:
                 break
-            if ai_calls >= MAX_AI_PER_SCAN:
-                print(f"  KI-Limit ({MAX_AI_PER_SCAN}) erreicht — Rest beim nächsten Scan.")
-                break
-            if not analysis_cooldown_ok(pair):
-                print(f"  {pair}: Analyse-Cooldown aktiv — übersprungen (spart Kosten)")
-                continue
-            print(f"  → KI-Analyse {pair} ({direction})...")
-            ai_calls += 1
-            last_analysis_time[pair] = datetime.now().isoformat()
-            save_state()
-            raw = await asyncio.to_thread(deep_analysis, pair, direction, a, htf)
+
+            if USE_AI_ANALYSIS:
+                # Optionaler KI-Modus (kostenpflichtig)
+                if ai_calls >= MAX_AI_PER_SCAN:
+                    print(f"  KI-Limit ({MAX_AI_PER_SCAN}) erreicht.")
+                    break
+                if not analysis_cooldown_ok(pair):
+                    print(f"  {pair}: Analyse-Cooldown aktiv — übersprungen")
+                    continue
+                print(f"  → KI-Analyse {pair} ({direction})...")
+                ai_calls += 1
+                last_analysis_time[pair] = datetime.now().isoformat()
+                save_state()
+                raw = await asyncio.to_thread(deep_analysis, pair, direction, a, htf)
+            else:
+                # Kostenlose technische Engine (Standard)
+                print(f"  → Technische Analyse {pair} ({direction})...")
+                raw = build_technical_signal(pair, direction, a, htf)
+
             if not raw or not raw.get("trade"):
                 scan_stats["rejections"].append(f"{pair}: kein Setup")
                 print(f"    abgelehnt (kein Trade)")
@@ -466,9 +561,24 @@ async def scan(bot: Bot):
             await tg_send(bot, format_signal(pair, s, htf))
             signals_today["count"] += 1
             last_signal_time[pair] = datetime.now().isoformat()
+            scan_stats["signals_this_run"].append(f"{pair} {direction.upper()}")
             save_state()
             print(f"    ✅ SIGNAL gesendet ({s['confidence']:.0f}/100, R:R {s['risk_reward']})")
 
+        # ── Scan-Zusammenfassung bauen (für Sofort-Meldung) ──
+        scan_stats["ai_calls"] = ai_calls
+        sigs = scan_stats["signals_this_run"]
+        rejs = scan_stats["rejections"]
+        t = datetime.now().strftime("%H:%M")
+        if sigs:
+            scan_stats["summary"] = (f"🔍 Scan {t}: {len(sigs)} Signal(e) gesendet "
+                                     f"({', '.join(sigs)}). Heute: {signals_today['count']}/{MAX_SIGNALS_DAY}")
+        elif rejs:
+            scan_stats["summary"] = (f"🔍 Scan {t}: kein Signal. Geprüft/verworfen: "
+                                     f"{', '.join(rejs[:6])}. Nächster in {SCAN_INTERVAL_MIN} Min.")
+        else:
+            scan_stats["summary"] = (f"🔍 Scan {t}: keine passenden Setups bei den {len(PAIRS)} Paaren. "
+                                     f"Nächster in {SCAN_INTERVAL_MIN} Min.")
         print(f"[{datetime.now():%H:%M}] Scan fertig. Heute: {signals_today['count']}/{MAX_SIGNALS_DAY}")
 
 # ═══════════════════════════════════════════════════════════════
@@ -520,9 +630,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 So funktioniert der Bot:\n\n"
-        f"Er scannt die {len(PAIRS)} Paare im {INTERVAL}-Takt (Daytrading), filtert technisch vor (Trend, RSI, MACD, ADX-Trendstärke), "
-        f"prüft den übergeordneten {HTF_INTERVAL}-Trend (Multi-Timeframe) und lässt nur die besten Setups von der KI "
-        f"analysieren — inkl. Live-Recherche zu Fundamental und Sentiment der großen Trader.\n\n"
+        f"Er scannt die {len(PAIRS)} Paare im {INTERVAL}-Takt (Scalping). Die Signale entstehen aus einer "
+        f"kostenlosen technischen Engine: Trend (EMA), RSI, MACD, ADX-Trendstärke, ATR-Stop, Swing-Ziele und "
+        f"{HTF_INTERVAL}-Multi-Timeframe-Bestätigung. Kein KI-Aufruf pro Signal = keine laufenden Kosten.\n\n"
         f"Nur Signale mit Confidence ≥ {CONFIDENCE_MIN} und Chance/Risiko ≥ 1:{MIN_RR} werden geschickt. "
         f"Stop-Loss und Take-Profit kommen aus echter Marktstruktur (ATR + Swing-Levels), nicht aus festen Prozenten. "
         f"Das Chance/Risiko wird aus den echten Levels nachgerechnet.\n\n"
@@ -552,7 +662,9 @@ async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text("🔍 Starte Sofort-Scan... (kann 1-2 Min dauern)")
     await scan(ctx.application.bot)
-    await update.message.reply_text("✅ Scan abgeschlossen. (/today für Details)")
+    # Ergebnis direkt zurückmelden (kein /today nötig)
+    summary = scan_stats.get("summary") or "🔍 Scan abgeschlossen."
+    await update.message.reply_text(summary)
 
 async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     reset_daily_if_needed()
@@ -650,6 +762,13 @@ async def scanner_loop(bot: Bot):
     while True:
         try:
             await scan(bot)
+            # Sofort-Meldung nur bei echter Aktivität (Setup analysiert), kein Spam bei leeren Scans.
+            # Bei gesendeten Signalen ist das Signal selbst schon die Meldung.
+            if (not scan_stats.get("closed_market")
+                    and not scan_stats.get("signals_this_run")
+                    and scan_stats.get("ai_calls", 0) > 0
+                    and scan_stats.get("summary")):
+                await tg_send(bot, scan_stats["summary"])
         except Exception as e:
             print(f"[SCAN ERROR] {e}")
         await asyncio.sleep(SCAN_INTERVAL_MIN * 60)
@@ -660,7 +779,8 @@ async def scanner_loop(bot: Bot):
 async def main():
     print("=" * 55)
     print("  📊 Forex Signal Bot — OPUS 4.8")
-    print(f"  Paare: {len(PAIRS)} | Signal: {AI_MODEL_SIGNAL} | Chat: {AI_MODEL_CHAT} | Deep: {AI_MODEL_DEEP}")
+    mode = "KI (Sonnet+Suche)" if USE_AI_ANALYSIS else "Technik (kostenlos)"
+    print(f"  Paare: {len(PAIRS)} | Analyse: {mode} | Chat: {AI_MODEL_CHAT} | Deep: {AI_MODEL_DEEP}")
     print("=" * 55)
     if not TELEGRAM_TOKEN:
         print("❌ TELEGRAM_TOKEN fehlt!"); return
@@ -688,7 +808,7 @@ async def main():
     bot = app.bot
     await tg_send(bot,
         "📊 Forex Signal Bot gestartet! (Opus 4.8)\n"
-        f"Überwache {len(PAIRS)} Major-Paare im 1h-Takt.\n"
+        f"Überwache {len(PAIRS)} Paare im {INTERVAL}-Takt (Scalping).\n"
         f"Max {MAX_SIGNALS_DAY} hochsichere Signale/Tag.\n"
         "💬 Stell mir jederzeit Fragen zum Markt!\n\n/help — Infos")
 
