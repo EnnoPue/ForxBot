@@ -65,6 +65,8 @@ OANDA_TOKEN      = os.getenv("OANDA_TOKEN", "")
 OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID", "")
 OANDA_ENV        = os.getenv("OANDA_ENV", "practice")        # practice = Demo, live = echt
 TRADING_ENABLED  = os.getenv("TRADING_ENABLED", "false").lower() == "true"
+# AUTO_TRADE=true → Signale werden automatisch ausgeführt (KEINE Accept-Bestätigung nötig)
+AUTO_TRADE       = os.getenv("AUTO_TRADE", "false").lower() in ("true", "1", "yes", "ja", "on")
 OANDA_BASE = ("https://api-fxpractice.oanda.com" if OANDA_ENV == "practice"
               else "https://api-fxtrade.oanda.com")
 NUM_TPS          = int(os.getenv("NUM_TPS", "3"))            # Anzahl Take-Profit-Stufen (= Teil-Trades)
@@ -1156,21 +1158,34 @@ def trade_buttons(sid: str) -> InlineKeyboardMarkup:
     ])
 
 async def send_signal_with_buttons(bot: Bot, pair: str, s: dict, htf: dict | None, rid: str | None = None):
-    """Sendet das Signal. Mit Trading-Buttons, wenn ein Broker konfiguriert; sonst nur Text."""
+    """Sendet das Signal. Auto-Trade führt direkt aus; sonst mit Accept-Buttons; ohne Broker nur Text."""
     global _trade_counter
     text = format_signal(pair, s, htf)
     if not (TRADING_ENABLED and broker_configured()):
         await tg_send(bot, text)
         return
-    _trade_counter += 1
-    sid = str(_trade_counter)
+
     sl_pips = pips_between(pair, s["entry"], s["stop_loss"])
     lots, _, _ = suggest_lot(s["confidence"], sl_pips, pair, s["entry"])
-    pending_trades[sid] = {
+    t = {
         "pair": pair, "direction": s["direction"], "entry": s["entry"],
         "stop_loss": s["stop_loss"], "take_profits": s["take_profits"], "lots": lots,
         "log_id": rid,
     }
+
+    # ── AUTO-TRADE: Signal senden + sofort ausführen (wie ein automatisches Accept) ──
+    if AUTO_TRADE:
+        await tg_send(bot, text + f"\n\n⚡ Auto-Trade aktiv — platziere Order automatisch ({broker_env_label()})...")
+        status = await asyncio.to_thread(execute_trade, t)
+        if rid and last_exec.get("orders_ok"):
+            mark_trade_opened(rid)
+        await tg_send(bot, status)
+        return
+
+    # ── Sonst: Signal mit Buttons, Ausführung erst nach deinem Accept ──
+    _trade_counter += 1
+    sid = str(_trade_counter)
+    pending_trades[sid] = t
     if not TELEGRAM_CHAT_ID:
         await tg_send(bot, text)
         return
@@ -1259,6 +1274,9 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         trade_mode = "❌ aus (TRADING_ENABLED=false)"
     else:
         trade_mode = f"✅ AN über {BROKER.capitalize()} — {'🟡 DEMO' if is_demo else '🔴 LIVE/ECHT'}"
+    if TRADING_ENABLED and broker_configured():
+        trade_mode += "\n⚡ Auto-Trade: " + ("AN (Signale werden automatisch ausgeführt)"
+                                             if AUTO_TRADE else "aus (Bestätigung per Accept)")
     analyse = "KI (Sonnet+Suche)" if USE_AI_ANALYSIS else "Technik (kostenlos)"
     await update.message.reply_text(
         f"📊 Status\nMarkt: {mo}\n"
@@ -1443,6 +1461,7 @@ def dashboard_payload() -> dict:
         "broker": BROKER,
         "env": (CAPITAL_ENV if BROKER == "capital" else OANDA_ENV),
         "trading_enabled": bool(TRADING_ENABLED and broker_configured()),
+        "auto_trade": bool(AUTO_TRADE and TRADING_ENABLED and broker_configured()),
         "pairs": PAIRS,
         "signals_today": signals_today,
         "max_signals_day": MAX_SIGNALS_DAY,
