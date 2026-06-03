@@ -38,16 +38,18 @@ _pairs_env = os.getenv("PAIRS", "").strip()
 PAIRS = ([p.strip().upper() for p in _pairs_env.split(",") if p.strip()]
          if _pairs_env else DEFAULT_PAIRS)
 
-INTERVAL          = os.getenv("INTERVAL", "15min")   # Scalping-Zeitfenster (schnelle Trades)
-HTF_INTERVAL      = "1h"        # übergeordneter Trend (1h passt zu 15min-Scalping)
-PRESCREEN_MIN     = 55          # Technischer Vorab-Filter (etwas lockerer fürs Scalping)
-CONFIDENCE_MIN    = int(os.getenv("CONFIDENCE_MIN", "70"))  # KI-Confidence-Schwelle
-MAX_SIGNALS_DAY   = int(os.getenv("MAX_SIGNALS_DAY", "6"))  # mehr Signale beim Scalping
-MAX_SIGNALS_PER_SCAN = 2        # nicht mehr als 2 Signale auf einmal (kein Schwung)
+STRATEGY          = os.getenv("STRATEGY", "orderblock").lower()  # "orderblock" oder "technical"
+_default_interval = "1h" if STRATEGY == "orderblock" else "15min"
+INTERVAL          = os.getenv("INTERVAL", _default_interval)   # Zeitfenster der Analyse
+HTF_INTERVAL      = os.getenv("HTF_INTERVAL", "4h" if STRATEGY == "orderblock" else "1h")  # übergeordneter Trend
+PRESCREEN_MIN     = 55          # Technischer Vorab-Filter (nur "technical")
+CONFIDENCE_MIN    = int(os.getenv("CONFIDENCE_MIN", "70"))  # Confidence-Schwelle
+MAX_SIGNALS_DAY   = int(os.getenv("MAX_SIGNALS_DAY", "6"))
+MAX_SIGNALS_PER_SCAN = 2        # nicht mehr als 2 Signale auf einmal
 MAX_AI_PER_SCAN   = 2           # max. KI-Analysen pro Scan (Kostenschutz)
 MIN_RR            = 1.5         # Mindest-Chance-Risiko-Verhältnis
-SCAN_INTERVAL_MIN = 25          # Scan-Takt (häufig fürs Scalping)
-SIGNAL_COOLDOWN_H = 2           # selbes Paar nicht öfter als alle 2h signalisieren
+SCAN_INTERVAL_MIN = int(os.getenv("SCAN_INTERVAL_MIN", "25"))   # Scan-Takt
+SIGNAL_COOLDOWN_H = int(os.getenv("SIGNAL_COOLDOWN_H", "6" if STRATEGY == "orderblock" else "2"))  # selbes Paar nicht öfter signalisieren
 ANALYSIS_COOLDOWN_H = 2         # selbes Paar nicht öfter als alle 2h analysieren
 HTF_TOP_CANDIDATES = 3          # nur für die besten N Kandidaten den HTF-Trend laden (Credit-Schutz)
 
@@ -401,6 +403,82 @@ def build_technical_signal(pair: str, direction: str, a: dict, htf: dict | None)
     }
 
 
+def build_orderblock_signal(pair: str, df, a: dict, htf: dict | None) -> dict | None:
+    """
+    Signal nach Order-Block-/Break-of-Structure-Methode (Smart-Money-Stil).
+    Einstieg im Retest der Order-Block-Zone, STRUKTURELLER Stop hinter dem Block
+    (breiter als ein ATR-Scalp-Stop → weniger Noise-Ausstoppen), Ziele an der Liquidität.
+    Gibt dasselbe Dict-Format wie build_technical_signal zurück.
+    """
+    atr = a["atr"]
+    if atr <= 0:
+        return {"trade": False}
+    ob = ind.detect_order_block(df, atr)
+    if not ob:
+        return {"trade": False}
+
+    direction = ob["direction"]
+    entry = ob["price"]
+    buf = 0.2 * atr                       # kleiner Puffer hinter den Block
+
+    if direction == "long":
+        sl = ob["ob_low"] - buf           # Stop UNTER dem Order-Block (strukturell)
+        risk = entry - sl
+        if risk <= 0:
+            return {"trade": False}
+        tp1 = ob["broke_level"] if ob["broke_level"] > entry + 1.0 * risk else entry + 1.5 * risk
+        tp2 = entry + 2.5 * risk
+        tp3 = entry + 4.0 * risk
+        tps = sorted([tp1, tp2, tp3])[:NUM_TPS]
+    else:  # short
+        sl = ob["ob_high"] + buf          # Stop ÜBER dem Order-Block
+        risk = sl - entry
+        if risk <= 0:
+            return {"trade": False}
+        tp1 = ob["broke_level"] if ob["broke_level"] < entry - 1.0 * risk else entry - 1.5 * risk
+        tp2 = entry - 2.5 * risk
+        tp3 = entry - 4.0 * risk
+        tps = sorted([tp1, tp2, tp3], reverse=True)[:NUM_TPS]
+
+    tp_first = tps[0]
+    rr = abs(tp_first - entry) / abs(entry - sl) if entry != sl else 0
+    if round(rr, 2) < MIN_RR:
+        return {"trade": False}
+
+    # ── Confidence ──
+    adx = a["adx"]
+    aligned = htf and ((direction == "long" and htf["trend"] == "bullish")
+                       or (direction == "short" and htf["trend"] == "bearish"))
+    conf = 60                              # Basis: valider OB + BOS + Retest
+    if aligned:        conf += 20          # in Richtung des übergeordneten Trends
+    if adx >= 22:      conf += 10          # Struktur mit Trendstärke
+    if rr >= 2.5:      conf += 5
+    conf = max(0, min(conf, 100))
+
+    hold = "mehrere Stunden bis 1-2 Tage"  # 1h/4h-Struktur-Trade
+    trend_word = "Aufwärts" if direction == "long" else "Abwärts"
+    zone = f"{ob['ob_low']:.5f}–{ob['ob_high']:.5f}"
+    reasoning = (f"Order-Block-Setup: Struktur nach {('oben' if direction=='long' else 'unten')} "
+                 f"gebrochen (BOS über/unter {ob['broke_level']:.5f}), Rückkehr in die "
+                 f"Order-Block-Zone {zone}. Einstieg im Retest, struktureller Stop hinter dem Block "
+                 f"({'unter' if direction=='long' else 'über'} der Zone, Puffer 0,2×ATR), "
+                 f"Ziele an der Liquidität (gebrochenes Level + Erweiterungen)."
+                 f"{' Übergeordneter ' + HTF_INTERVAL + '-Trend bestätigt.' if aligned else ' (Ohne HTF-Bestätigung — vorsichtiger.)'}")
+
+    return {
+        "trade": True,
+        "direction": direction,
+        "entry": entry, "stop_loss": sl,
+        "take_profit": tp_first, "take_profits": tps,
+        "confidence": conf, "risk_reward": round(rr, 2),
+        "haltedauer": hold,
+        "fundamental": "⚠️ Rein technisches Order-Block-Signal — keine News-/Fundamentalanalyse. "
+                       "Wirtschaftskalender selbst prüfen. Für tiefe Recherche: /deep",
+        "sentiment": f"Smart-Money-Struktur: {trend_word}-Bruch + Order-Block-Retest.",
+        "reasoning": reasoning,
+    }
+
+
 def deep_analysis(pair: str, direction: str, a: dict, htf: dict | None) -> dict | None:
     """
     Lässt Opus 4.8 eine Confluence-Analyse machen:
@@ -566,8 +644,8 @@ async def scan(bot: Bot):
             scan_stats["summary"] = "🔍 Markt geschlossen (Wochenende) — keine Analyse."
             return
 
-        print(f"\n[{datetime.now():%H:%M}] 🔍 Scan {len(PAIRS)} Paare | Session: {current_session()}")
-        # ── Stufe 1: technischer Vorfilter ({INTERVAL}) ──
+        print(f"\n[{datetime.now():%H:%M}] 🔍 Scan {len(PAIRS)} Paare ({STRATEGY}) | Session: {current_session()}")
+        # ── Stufe 1: Kandidaten finden ({INTERVAL}) ──
         candidates = []
         for pair in PAIRS:
             if not cooldown_ok(pair):
@@ -576,30 +654,40 @@ async def scan(bot: Bot):
             if df is None or len(df) < 210:
                 continue
             a = ind.analyze(df)
-            score, direction = ind.prescreen_score(a)
-            print(f"  {pair}: {INTERVAL}-prescreen {score}/100 ({direction}, ADX {a['adx']:.0f})")
-            if score >= PRESCREEN_MIN and direction != "none":
-                candidates.append((pair, direction, a, score))
+            if STRATEGY == "orderblock":
+                ob = ind.detect_order_block(df, a["atr"])
+                if ob:
+                    direction = ob["direction"]
+                    score = int(a["adx"])          # Ranking nach Trendstärke
+                    print(f"  {pair}: Order-Block {direction} erkannt (ADX {a['adx']:.0f}, Zone-Retest)")
+                    candidates.append((pair, direction, a, score, df))
+                else:
+                    print(f"  {pair}: kein Order-Block-Setup")
+            else:
+                score, direction = ind.prescreen_score(a)
+                print(f"  {pair}: {INTERVAL}-prescreen {score}/100 ({direction}, ADX {a['adx']:.0f})")
+                if score >= PRESCREEN_MIN and direction != "none":
+                    candidates.append((pair, direction, a, score, df))
 
-        # Nur die besten Kandidaten weiterverfolgen (HTF-Fetch + KI = Credits/Kosten sparen)
+        # Nur die besten Kandidaten weiterverfolgen (HTF-Fetch = Credits sparen)
         candidates.sort(key=lambda x: x[3], reverse=True)
         candidates = candidates[:HTF_TOP_CANDIDATES]
 
         # ── Stufe 2: {HTF_INTERVAL}-Multi-Timeframe-Filter (nur Top-Kandidaten) ──
         aligned = []
-        for pair, direction, a, score in candidates:
+        for pair, direction, a, score, df in candidates:
             htf = await asyncio.to_thread(htf_trend, pair)
             if htf:
                 # Konflikt mit höherem Zeitfenster → raus
                 if direction == "long" and htf["trend"] == "bearish":
-                    print(f"  {pair}: verworfen — {INTERVAL} long vs. {HTF_INTERVAL} bearish")
+                    print(f"  {pair}: verworfen — {direction} vs. {HTF_INTERVAL} bearish")
                     scan_stats["rejections"].append(f"{pair}: {HTF_INTERVAL}-Konflikt")
                     continue
                 if direction == "short" and htf["trend"] == "bullish":
-                    print(f"  {pair}: verworfen — {INTERVAL} short vs. {HTF_INTERVAL} bullish")
+                    print(f"  {pair}: verworfen — {direction} vs. {HTF_INTERVAL} bullish")
                     scan_stats["rejections"].append(f"{pair}: {HTF_INTERVAL}-Konflikt")
                     continue
-            aligned.append((pair, direction, a, score, htf))
+            aligned.append((pair, direction, a, score, df, htf))
 
         scan_stats["candidates"] = len(aligned)
 
@@ -607,15 +695,19 @@ async def scan(bot: Bot):
         aligned.sort(key=lambda x: x[3], reverse=True)
         ai_calls = 0
         sent_this_scan = 0
-        for pair, direction, a, score, htf in aligned:
+        for pair, direction, a, score, df, htf in aligned:
             if signals_today["count"] >= MAX_SIGNALS_DAY:
                 break
             if sent_this_scan >= MAX_SIGNALS_PER_SCAN:
                 print(f"  Max {MAX_SIGNALS_PER_SCAN} Signale/Scan erreicht — Rest beim nächsten Scan.")
                 break
 
-            if USE_AI_ANALYSIS:
-                # Optionaler KI-Modus (kostenpflichtig)
+            if STRATEGY == "orderblock":
+                # Order-Block-Methode (kostenlos, strukturbasiert)
+                print(f"  → Order-Block-Analyse {pair} ({direction})...")
+                raw = build_orderblock_signal(pair, df, a, htf)
+            elif USE_AI_ANALYSIS:
+                # Optionaler KI-Modus (kostenpflichtig, nur 'technical')
                 if ai_calls >= MAX_AI_PER_SCAN:
                     print(f"  KI-Limit ({MAX_AI_PER_SCAN}) erreicht.")
                     break
@@ -628,7 +720,7 @@ async def scan(bot: Bot):
                 save_state()
                 raw = await asyncio.to_thread(deep_analysis, pair, direction, a, htf)
             else:
-                # Kostenlose technische Engine (Standard)
+                # Kostenlose technische Engine
                 print(f"  → Technische Analyse {pair} ({direction})...")
                 raw = build_technical_signal(pair, direction, a, htf)
 
@@ -809,20 +901,26 @@ def capital_login():
     except Exception as e:
         return None, None, str(e)
 
-def capital_place_order(cst, xsec, epic, direction, size, level, sl, tp, digits) -> dict:
-    """Platziert eine LIMIT-Working-Order mit SL & TP über Capital.com."""
-    url = f"{CAPITAL_BASE}/api/v1/workingorders"
+def capital_place_order(cst, xsec, epic, direction, size, level, sl, tp, digits,
+                        order_type="LIMIT") -> dict:
+    """Platziert eine Order mit SL & TP über Capital.com.
+    order_type LIMIT = Working-Order auf Pullback-Level; MARKET = sofort zum Marktpreis."""
     headers = {"CST": cst, "X-SECURITY-TOKEN": xsec, "Content-Type": "application/json"}
-    body = {
-        "epic": epic,
-        "direction": direction,           # BUY oder SELL
-        "size": size,
-        "level": round(level, digits),
-        "type": "LIMIT",
-        "stopLevel": round(sl, digits),
-        "profitLevel": round(tp, digits),
-        "guaranteedStop": False,
-    }
+    if order_type == "MARKET":
+        url = f"{CAPITAL_BASE}/api/v1/positions"
+        body = {
+            "epic": epic, "direction": direction, "size": size,
+            "guaranteedStop": False,
+            "stopLevel": round(sl, digits), "profitLevel": round(tp, digits),
+        }
+    else:
+        url = f"{CAPITAL_BASE}/api/v1/workingorders"
+        body = {
+            "epic": epic, "direction": direction, "size": size,
+            "level": round(level, digits), "type": "LIMIT",
+            "stopLevel": round(sl, digits), "profitLevel": round(tp, digits),
+            "guaranteedStop": False,
+        }
     try:
         r = requests.post(url, headers=headers, json=body, timeout=15)
         data = r.json() if r.content else {}
@@ -849,21 +947,25 @@ def capital_min_size(cst, xsec, epic) -> float | None:
 
 def capital_place_order_grow(cst, xsec, epic, direction, size, level, sl, tp, digits) -> dict:
     """
-    Platziert eine Order und VERGRÖSSERT die Size automatisch, falls Capital sie
-    als zu klein ablehnt (error.invalid.size.minvalue). So trifft sie immer das Minimum.
+    Platziert eine MARKT-Order (Einstieg sofort) mit Stop UND Take-Profit.
+    Markt-Order, weil dort stopLevel + profitLevel zuverlässig zusammen gesetzt werden
+    (bei Limit-Working-Orders wird der TP von Capital nicht übernommen).
+    Vergrößert die Size automatisch, falls Capital sie als zu klein ablehnt.
     """
     s = max(float(size), 0.01)
     last = ""
-    for _ in range(9):                       # 0.01 → ... → bis akzeptiert (max ~×256)
-        res = capital_place_order(cst, xsec, epic, direction, round(s, 2), level, sl, tp, digits)
+    for _ in range(9):
+        res = capital_place_order(cst, xsec, epic, direction, round(s, 2),
+                                  level, sl, tp, digits, "MARKET")
         if res["ok"]:
             res["size"] = round(s, 2)
+            res["type"] = "MARKET"
             return res
         last = str(res.get("err", "")).lower()
         if "minvalue" in last or ("min" in last and "size" in last):
-            s = s * 2 if s > 0 else 1.0      # zu klein → verdoppeln und erneut
+            s = s * 2 if s > 0 else 1.0          # zu klein → verdoppeln
             continue
-        return res                            # anderer Fehler → abbrechen
+        return res                                # anderer Fehler → abbrechen
     return {"ok": False, "err": last}
 
 def execute_trade_capital(t: dict) -> str:
@@ -894,7 +996,8 @@ def execute_trade_capital(t: dict) -> str:
         if res["ok"]:
             ok_count += 1
             used = res["size"]
-            lines.append(f"  ✅ Teil-Order {i}/{len(tps)} → TP{i} | Size {res['size']} (Ref {res['id'][:10]})")
+            typ = "Limit" if res.get("type") == "LIMIT" else "Markt"
+            lines.append(f"  ✅ Teil-Order {i}/{len(tps)} → TP{i} | {typ} | Size {res['size']} (Ref {res['id'][:10]})")
         else:
             lines.append(f"  ❌ Teil-Order {i}: {res['err']}")
 
