@@ -1101,14 +1101,12 @@ def execute_trade_capital(t: dict) -> str:
     direction = "BUY" if t["direction"] == "long" else "SELL"
     tps = t["take_profits"]
 
-    # Gewünschte Gesamt-Größe (in Capital-Size, KEIN Lot mehr)
-    total = t["lots"] * CAPITAL_SIZE_FACTOR
-    per = round(total / len(tps), 2)
-    # Falls bekannt, schon mal aufs Broker-Minimum heben (spart Versuche); sonst regelt Auto-Grow
+    # Größe je Teil-Order: Risiko-Basis, aufs Broker-Minimum heben, DANN mit dem Größen-Faktor skalieren
+    per = round(t["lots"] / len(tps), 2)
     min_size = capital_min_size(cst, xsec, epic) or CAPITAL_MIN_SIZE
     if min_size and per < min_size:
         per = min_size
-    per = max(per, 0.01)
+    per = round(max(per, 0.01) * CAPITAL_SIZE_FACTOR, 2)   # ← Größen-Hebel wirkt jetzt wirklich
 
     lines, ok_count, used = [], 0, None
     for i, tp in enumerate(tps, 1):
