@@ -4,6 +4,7 @@ import os
 import re
 import threading
 import time as _time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import requests
 import pandas as pd
 from datetime import datetime, timezone, date
@@ -80,7 +81,11 @@ CAPITAL_MIN_SIZE    = float(os.getenv("CAPITAL_MIN_SIZE", "0"))       # manuelle
 CAPITAL_BASE = ("https://demo-api-capital.backend-capital.com" if CAPITAL_ENV == "demo"
                 else "https://api-capital.backend-capital.com")
 TD_MIN_GAP        = 8.0         # min. Sekunden zwischen Twelve-Data-Calls (≈8/min)
-STATE_FILE        = "state.json"
+# Speicherort: für dauerhafte Logs in Railway ein Volume mounten und STATE_DIR daraufsetzen
+STATE_DIR         = os.getenv("STATE_DIR", ".")
+STATE_FILE        = os.path.join(STATE_DIR, "state.json")
+TRADELOG_FILE     = os.path.join(STATE_DIR, "trade_log.json")
+DASHBOARD_PORT    = int(os.getenv("PORT", os.getenv("DASHBOARD_PORT", "8080")))
 
 anthropic = Anthropic(api_key=ANTHROPIC_KEY)
 scan_lock = asyncio.Lock()
@@ -197,8 +202,117 @@ chat_history: list = []
 signals_today = {"date": str(date.today()), "count": 0}
 last_signal_time: dict = {}     # pair -> ISO timestamp (nach gesendetem Signal)
 last_analysis_time: dict = {}   # pair -> ISO timestamp (nach Opus-Analyse, egal welches Ergebnis)
+trade_log: list = []            # alle Signale + ausgeführte Trades + Ergebnisse (fürs Dashboard)
+last_exec: dict = {}            # zuletzt ausgeführte Order-Infos (Size etc.) für die Protokollierung
 scan_stats = {"last_run": None, "candidates": 0, "rejections": [],
               "signals_this_run": [], "ai_calls": 0, "summary": None, "closed_market": False}
+
+def save_trade_log():
+    try:
+        with open(TRADELOG_FILE, "w") as f:
+            json.dump(trade_log, f)
+    except Exception as e:
+        print(f"[TRADELOG save] {e}")
+
+def load_trade_log():
+    global trade_log
+    if not os.path.exists(TRADELOG_FILE):
+        return
+    try:
+        with open(TRADELOG_FILE) as f:
+            trade_log = json.load(f)
+    except Exception as e:
+        print(f"[TRADELOG load] {e}")
+
+def log_signal(pair: str, s: dict, strategy: str, df) -> str:
+    """Protokolliert ein gesendetes Signal. Gibt die Datensatz-ID zurück."""
+    rid = f"{pair.replace('/','')}-{int(datetime.now().timestamp())}-{len(trade_log)}"
+    entry_dt = None
+    try:
+        if df is not None and "datetime" in df.columns and len(df):
+            entry_dt = str(df["datetime"].iloc[-1])
+    except Exception:
+        pass
+    trade_log.append({
+        "id": rid,
+        "suggested_at": datetime.now().isoformat(timespec="seconds"),
+        "entry_dt": entry_dt,                 # letzte Kerze bei Signal (Feed-Zeit, für Outcome)
+        "pair": pair, "strategy": strategy,
+        "direction": s["direction"],
+        "entry": round(s["entry"], 6),
+        "stop_loss": round(s["stop_loss"], 6),
+        "take_profits": [round(x, 6) for x in s["take_profits"]],
+        "tp1": round(s["take_profits"][0], 6),
+        "confidence": round(float(s["confidence"]), 1),
+        "rr": round(float(s["risk_reward"]), 2),
+        "haltedauer": s.get("haltedauer", ""),
+        "opened": False,                       # vom Nutzer per Accept geöffnet?
+        "opened_at": None,
+        "order_type": None,                    # Markt/Limit
+        "exec_size": None,                     # tatsächliche Capital-Size je Teil-Order
+        "orders_ok": None,
+        "status": "suggested",                # suggested | open | win | loss
+        "result_r": None,                      # erreichtes R (TP1 = +rr, SL = -1)
+        "closed_at": None,
+    })
+    save_trade_log()
+    return rid
+
+def mark_trade_opened(rid: str):
+    """Markiert einen Datensatz als vom Nutzer geöffnet (mit echter Order-Größe)."""
+    for r in trade_log:
+        if r["id"] == rid:
+            r["opened"] = True
+            r["opened_at"] = datetime.now().isoformat(timespec="seconds")
+            r["status"] = "open" if r["status"] == "suggested" else r["status"]
+            r["order_type"] = last_exec.get("order_type")
+            r["exec_size"] = last_exec.get("size")
+            r["orders_ok"] = last_exec.get("orders_ok")
+            save_trade_log()
+            return
+
+def update_open_outcomes(pair: str, df):
+    """Trägt Ergebnisse (TP1 oder SL zuerst getroffen) für offene Datensätze nach — preisbasiert."""
+    if df is None or "datetime" not in df.columns or not len(df):
+        return
+    changed = False
+    for r in trade_log:
+        if r["pair"] != pair or r["status"] not in ("suggested", "open"):
+            continue
+        # nur Kerzen NACH dem Signal betrachten (gleicher Feed → Zeitzonen passen)
+        try:
+            after = df
+            if r.get("entry_dt"):
+                after = df[df["datetime"] > r["entry_dt"]]
+            if after is None or not len(after):
+                continue
+            highs = after["high"].to_numpy()
+            lows = after["low"].to_numpy()
+        except Exception:
+            continue
+        sl, tp1, direction = r["stop_loss"], r["tp1"], r["direction"]
+        hit = None
+        # chronologisch durchgehen: was kam zuerst?
+        for hi, lo in zip(highs, lows):
+            if direction == "long":
+                sl_hit = lo <= sl
+                tp_hit = hi >= tp1
+            else:
+                sl_hit = hi >= sl
+                tp_hit = lo <= tp1
+            if sl_hit and tp_hit:
+                hit = "loss"; break          # beides in einer Kerze → konservativ als Verlust werten
+            if sl_hit:
+                hit = "loss"; break
+            if tp_hit:
+                hit = "win"; break
+        if hit:
+            r["status"] = hit
+            r["result_r"] = round(r["rr"], 2) if hit == "win" else -1.0
+            r["closed_at"] = datetime.now().isoformat(timespec="seconds")
+            changed = True
+    if changed:
+        save_trade_log()
 
 def save_state():
     try:
@@ -648,11 +762,18 @@ async def scan(bot: Bot):
         # ── Stufe 1: Kandidaten finden ({INTERVAL}) ──
         candidates = []
         for pair in PAIRS:
-            if not cooldown_ok(pair):
+            # df auch holen, wenn das Paar im Cooldown ist, ABER offene Trades hat (für Outcome-Update)
+            has_open = any(r["pair"] == pair and r["status"] in ("suggested", "open")
+                           for r in trade_log)
+            cooled = cooldown_ok(pair)
+            if not cooled and not has_open:
                 continue
             df = await asyncio.to_thread(fetch_ohlc, pair)
             if df is None or len(df) < 210:
                 continue
+            update_open_outcomes(pair, df)        # Ergebnisse (TP1/SL) automatisch nachtragen
+            if not cooled:
+                continue                          # nur Outcome-Update, kein neues Signal (Cooldown)
             a = ind.analyze(df)
             if STRATEGY == "orderblock":
                 ob = ind.detect_order_block(df, a["atr"])
@@ -741,8 +862,9 @@ async def scan(bot: Bot):
                 scan_stats["rejections"].append(f"{pair}: R:R {s['risk_reward']}")
                 print(f"    abgelehnt (R:R {s['risk_reward']})")
                 continue
-            # ── Signal senden (mit Trading-Buttons, falls OANDA aktiv) ──
-            await send_signal_with_buttons(bot, pair, s, htf)
+            # ── Signal protokollieren (fürs Dashboard) + senden ──
+            rid = log_signal(pair, s, STRATEGY, df)
+            await send_signal_with_buttons(bot, pair, s, htf, rid)
             signals_today["count"] += 1
             sent_this_scan += 1
             last_signal_time[pair] = datetime.now().isoformat()
@@ -1002,6 +1124,10 @@ def execute_trade_capital(t: dict) -> str:
             lines.append(f"  ❌ Teil-Order {i}: {res['err']}")
 
     head = (f"📈 {pair} {direction} ({epic}) — {ok_count}/{len(tps)} Orders ({CAPITAL_ENV})\n")
+    # Order-Infos fürs Dashboard merken
+    last_exec.clear()
+    last_exec.update({"size": used, "orders_ok": ok_count, "orders_total": len(tps),
+                      "order_type": "Markt"})
     note = ""
     if ok_count and used and used > per + 0.001:
         note = (f"\n\nℹ️ Größe automatisch auf {used} angehoben (Capital-Mindestgröße). "
@@ -1031,8 +1157,8 @@ def trade_buttons(sid: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("✏️ LOT bearbeiten", callback_data=f"lot:{sid}")],
     ])
 
-async def send_signal_with_buttons(bot: Bot, pair: str, s: dict, htf: dict | None):
-    """Sendet das Signal. Mit Trading-Buttons, wenn OANDA konfiguriert; sonst nur Text."""
+async def send_signal_with_buttons(bot: Bot, pair: str, s: dict, htf: dict | None, rid: str | None = None):
+    """Sendet das Signal. Mit Trading-Buttons, wenn ein Broker konfiguriert; sonst nur Text."""
     global _trade_counter
     text = format_signal(pair, s, htf)
     if not (TRADING_ENABLED and broker_configured()):
@@ -1045,6 +1171,7 @@ async def send_signal_with_buttons(bot: Bot, pair: str, s: dict, htf: dict | Non
     pending_trades[sid] = {
         "pair": pair, "direction": s["direction"], "entry": s["entry"],
         "stop_loss": s["stop_loss"], "take_profits": s["take_profits"], "lots": lots,
+        "log_id": rid,
     }
     if not TELEGRAM_CHAT_ID:
         await tg_send(bot, text)
@@ -1088,6 +1215,9 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_reply_markup(reply_markup=None)
         await q.message.reply_text(f"⏳ Platziere Orders für {t['pair']} ({broker_env_label()})...")
         status = await asyncio.to_thread(execute_trade, t)
+        # Im Dashboard als "von dir geöffnet" markieren (mit echter Order-Größe)
+        if t.get("log_id") and last_exec.get("orders_ok"):
+            mark_trade_opened(t["log_id"])
         pending_trades.pop(sid, None)
         await q.message.reply_text(status)
 
@@ -1302,6 +1432,82 @@ async def scanner_loop(bot: Bot):
         await asyncio.sleep(SCAN_INTERVAL_MIN * 60)
 
 # ═══════════════════════════════════════════════════════════════
+#  DASHBOARD-WEBSERVER (liefert Dashboard-HTML + JSON-Daten)
+# ═══════════════════════════════════════════════════════════════
+def dashboard_payload() -> dict:
+    """Alle Daten fürs Dashboard (Statistiken rechnet das Frontend)."""
+    snapshot = list(trade_log)   # Kopie, da der Bot-Thread parallel schreibt
+    return {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "strategy": STRATEGY,
+        "interval": INTERVAL,
+        "htf": HTF_INTERVAL,
+        "broker": BROKER,
+        "env": (CAPITAL_ENV if BROKER == "capital" else OANDA_ENV),
+        "trading_enabled": bool(TRADING_ENABLED and broker_configured()),
+        "pairs": PAIRS,
+        "signals_today": signals_today,
+        "max_signals_day": MAX_SIGNALS_DAY,
+        "confidence_min": CONFIDENCE_MIN,
+        "min_rr": MIN_RR,
+        "size_factor": CAPITAL_SIZE_FACTOR,
+        "trades": snapshot,
+    }
+
+def _read_dashboard_html() -> str:
+    here = os.path.dirname(os.path.abspath(__file__))
+    for p in (os.getenv("DASHBOARD_FILE", "dashboard.html"),
+              os.path.join(here, "dashboard.html")):
+        try:
+            with open(p, encoding="utf-8") as f:
+                return f.read()
+        except Exception:
+            continue
+    return ("<html><body style='font-family:sans-serif;background:#111;color:#eee;padding:2rem'>"
+            "<h1>Dashboard-Datei fehlt</h1><p>Lege <code>dashboard.html</code> ins Repo "
+            "(gleicher Ordner wie bot.py).</p></body></html>")
+
+class DashHandler(BaseHTTPRequestHandler):
+    def _cors(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+
+    def do_OPTIONS(self):
+        self.send_response(204); self._cors()
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        self.end_headers()
+
+    def do_GET(self):
+        path = self.path.split("?", 1)[0].rstrip("/") or "/"
+        if path in ("/", "/dashboard", "/index.html"):
+            body = _read_dashboard_html().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self._cors(); self.end_headers(); self.wfile.write(body)
+        elif path in ("/api/data", "/data", "/api/trades"):
+            try:
+                body = json.dumps(dashboard_payload()).encode("utf-8")
+            except Exception as e:
+                body = json.dumps({"error": str(e)}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self._cors(); self.end_headers(); self.wfile.write(body)
+        else:
+            self.send_response(404); self._cors(); self.end_headers()
+            self.wfile.write(b"not found")
+
+    def log_message(self, *args):
+        pass   # kein HTTP-Logspam in den Railway-Logs
+
+def start_dashboard_server():
+    try:
+        httpd = ThreadingHTTPServer(("0.0.0.0", DASHBOARD_PORT), DashHandler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        print(f"[Dashboard] Webserver läuft auf Port {DASHBOARD_PORT}  (/  und  /api/data)")
+    except Exception as e:
+        print(f"[Dashboard] Server-Start fehlgeschlagen: {e}")
+
+# ═══════════════════════════════════════════════════════════════
 #  MAIN
 # ═══════════════════════════════════════════════════════════════
 async def main():
@@ -1316,7 +1522,9 @@ async def main():
         print("⚠️ TWELVE_DATA_KEY fehlt — keine Kursdaten möglich!")
 
     load_state()
+    load_trade_log()
     reset_daily_if_needed()
+    start_dashboard_server()
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
