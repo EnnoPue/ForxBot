@@ -135,3 +135,64 @@ def prescreen_score(ind: dict) -> tuple[int, str]:
     elif adx_v >= 18: score += 5
 
     return min(score, 100), direction
+
+
+def detect_order_block(df, atr):
+    """
+    Order-Block-/Break-of-Structure-Erkennung (Smart-Money-Stil), regelbasiert.
+
+    Idee (bullisch): starker Impuls macht ein jüngstes Swing-Hoch (Struktur gebrochen),
+    danach zieht der Preis in den Order-Block zurück = letzte bärische Kerze vor dem Impuls.
+    Einstieg im Retest der Zone. Bärisch spiegelbildlich.
+
+    Gibt dict(direction, ob_low, ob_high, broke_level, price) oder None.
+    """
+    if df is None or len(df) < 40 or atr <= 0:
+        return None
+    window = 30
+    o = df["open"].to_numpy()[-window:]
+    h = df["high"].to_numpy()[-window:]
+    l = df["low"].to_numpy()[-window:]
+    c = df["close"].to_numpy()[-window:]
+    n = len(c); price = float(c[-1])
+    recent = 3          # mind. so viele Kerzen Pullback nach dem Impuls-Hoch/Tief
+
+    # ── Bullisch: jüngstes Swing-Hoch (jünger als das Tief), danach Pullback in den Order-Block ──
+    i_high = int(np.argmax(h))
+    i_low = int(np.argmin(l))
+    if 3 <= i_high <= n - 1 - recent and i_high > i_low:
+        idx = None
+        for i in range(i_high - 1, max(i_high - 8, 0) - 1, -1):
+            if c[i] < o[i]:                       # letzte bärische Kerze vor dem Impuls
+                idx = i; break
+        if idx is not None:
+            ob_low, ob_high = float(l[idx]), float(h[idx])
+            swing_high = float(h[i_high])
+            impulse = swing_high - ob_low
+            retr = swing_high - price
+            if (impulse >= 2.0 * atr                       # echter Impuls (kein Rauschen)
+                    and ob_low <= price <= ob_high * 1.0010  # Preis im OB-Retest
+                    and price > ob_low                        # Order-Block noch intakt
+                    and retr >= 0.4 * impulse):               # echte Korrektur
+                return {"direction": "long", "ob_low": ob_low, "ob_high": ob_high,
+                        "broke_level": swing_high, "price": price}
+
+    # ── Bärisch: jüngstes Swing-Tief (jünger als das Hoch), danach Pullback in den Order-Block ──
+    if 3 <= i_low <= n - 1 - recent and i_low > i_high:
+        idx = None
+        for i in range(i_low - 1, max(i_low - 8, 0) - 1, -1):
+            if c[i] > o[i]:                       # letzte bullische Kerze vor dem Impuls
+                idx = i; break
+        if idx is not None:
+            ob_low, ob_high = float(l[idx]), float(h[idx])
+            swing_low = float(l[i_low])
+            impulse = ob_high - swing_low
+            retr = price - swing_low
+            if (impulse >= 2.0 * atr
+                    and ob_low * 0.9990 <= price <= ob_high
+                    and price < ob_high
+                    and retr >= 0.4 * impulse):
+                return {"direction": "short", "ob_low": ob_low, "ob_high": ob_high,
+                        "broke_level": swing_low, "price": price}
+
+    return None
