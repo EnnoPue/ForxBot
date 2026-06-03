@@ -67,6 +67,9 @@ OANDA_ENV        = os.getenv("OANDA_ENV", "practice")        # practice = Demo, 
 TRADING_ENABLED  = os.getenv("TRADING_ENABLED", "false").lower() == "true"
 # AUTO_TRADE=true → Signale werden automatisch ausgeführt (KEINE Accept-Bestätigung nötig)
 AUTO_TRADE       = os.getenv("AUTO_TRADE", "false").lower() in ("true", "1", "yes", "ja", "on")
+# Breakeven: sobald der Trade BREAKEVEN_AT_R im Gewinn ist, Stop auf Einstieg ziehen
+BREAKEVEN_ENABLED = os.getenv("BREAKEVEN", "true").lower() in ("true", "1", "yes", "ja", "on")
+BREAKEVEN_AT_R    = float(os.getenv("BREAKEVEN_AT_R", "1.0"))   # ab wie viel R Gewinn auf BE ziehen
 OANDA_BASE = ("https://api-fxpractice.oanda.com" if OANDA_ENV == "practice"
               else "https://api-fxtrade.oanda.com")
 NUM_TPS          = int(os.getenv("NUM_TPS", "3"))            # Anzahl Take-Profit-Stufen (= Teil-Trades)
@@ -270,6 +273,8 @@ def mark_trade_opened(rid: str):
             r["order_type"] = last_exec.get("order_type")
             r["exec_size"] = last_exec.get("size")
             r["orders_ok"] = last_exec.get("orders_ok")
+            r["capital_deals"] = last_exec.get("deal_ids") or []   # für Breakeven
+            r["be_done"] = False                                    # Stop schon auf BE gezogen?
             save_trade_log()
             return
 
@@ -315,6 +320,45 @@ def update_open_outcomes(pair: str, df):
             changed = True
     if changed:
         save_trade_log()
+
+def process_breakevens(prices: dict) -> list:
+    """Zieht den Stop offener Capital-Trades auf Einstieg, sobald BREAKEVEN_AT_R Gewinn erreicht ist."""
+    if not (BREAKEVEN_ENABLED and BROKER == "capital"):
+        return []
+    todo = [r for r in trade_log
+            if r.get("status") == "open" and r.get("capital_deals") and not r.get("be_done")]
+    if not todo:
+        return []
+    cst, xsec, err = capital_login()
+    if err:
+        return []
+    msgs, changed = [], False
+    for r in todo:
+        price = prices.get(r["pair"])
+        if price is None:
+            continue
+        entry, sl, direction = r["entry"], r["stop_loss"], r["direction"]
+        risk = abs(entry - sl)
+        if risk <= 0:
+            continue
+        progress = (price - entry) if direction == "long" else (entry - price)
+        if progress < BREAKEVEN_AT_R * risk - 1e-9:    # erst ab BREAKEVEN_AT_R Gewinn (float-robust)
+            continue
+        # Stop auf Einstieg ziehen (Breakeven) — ALLE Teil-Positionen, nicht abbrechen
+        digits = capital_digits(r["pair"])
+        results = [capital_update_stop(cst, xsec, did, entry, digits)
+                   for did in r["capital_deals"]]
+        ok_any = any(results)
+        if ok_any:
+            r["be_done"] = True
+            changed = True
+            rr_done = round(progress / risk, 2)
+            msgs.append(
+                f"🔒 {r['pair']} {direction.upper()}: Stop auf Breakeven gezogen "
+                f"(Einstieg {entry:.5f}). Trade läuft +{rr_done}R — kann jetzt nicht mehr ins Minus drehen.")
+    if changed:
+        save_trade_log()
+    return msgs
 
 def save_state():
     try:
@@ -763,8 +807,9 @@ async def scan(bot: Bot):
         print(f"\n[{datetime.now():%H:%M}] 🔍 Scan {len(PAIRS)} Paare ({STRATEGY}) | Session: {current_session()}")
         # ── Stufe 1: Kandidaten finden ({INTERVAL}) ──
         candidates = []
+        prices = {}                                # aktuelle Kurse (für Breakeven)
         for pair in PAIRS:
-            # df auch holen, wenn das Paar im Cooldown ist, ABER offene Trades hat (für Outcome-Update)
+            # df auch holen, wenn das Paar im Cooldown ist, ABER offene Trades hat (für Outcome-Update/BE)
             has_open = any(r["pair"] == pair and r["status"] in ("suggested", "open")
                            for r in trade_log)
             cooled = cooldown_ok(pair)
@@ -773,6 +818,7 @@ async def scan(bot: Bot):
             df = await asyncio.to_thread(fetch_ohlc, pair)
             if df is None or len(df) < 210:
                 continue
+            prices[pair] = float(df["close"].iloc[-1])
             update_open_outcomes(pair, df)        # Ergebnisse (TP1/SL) automatisch nachtragen
             if not cooled:
                 continue                          # nur Outcome-Update, kein neues Signal (Cooldown)
@@ -791,6 +837,11 @@ async def scan(bot: Bot):
                 print(f"  {pair}: {INTERVAL}-prescreen {score}/100 ({direction}, ADX {a['adx']:.0f})")
                 if score >= PRESCREEN_MIN and direction != "none":
                     candidates.append((pair, direction, a, score, df))
+
+        # ── Breakeven: Stops offener Trades auf Einstieg ziehen, wenn im Gewinn ──
+        if BREAKEVEN_ENABLED:
+            for m in await asyncio.to_thread(process_breakevens, prices):
+                await tg_send(bot, m)
 
         # Nur die besten Kandidaten weiterverfolgen (HTF-Fetch = Credits sparen)
         candidates.sort(key=lambda x: x[3], reverse=True)
@@ -1069,6 +1120,33 @@ def capital_min_size(cst, xsec, epic) -> float | None:
         pass
     return None
 
+def capital_deal_id(cst, xsec, deal_ref: str):
+    """Löst eine dealReference in die echte Position-ID (dealId) auf."""
+    url = f"{CAPITAL_BASE}/api/v1/confirms/{deal_ref}"
+    headers = {"CST": cst, "X-SECURITY-TOKEN": xsec}
+    try:
+        r = requests.get(url, headers=headers, timeout=15)
+        if r.status_code == 200:
+            d = r.json() or {}
+            ad = d.get("affectedDeals") or []
+            if ad and ad[0].get("dealId"):
+                return ad[0]["dealId"]
+            return d.get("dealId")
+    except Exception:
+        pass
+    return None
+
+def capital_update_stop(cst, xsec, deal_id: str, stop_level: float, digits: int) -> bool:
+    """Verschiebt den Stop einer offenen Position (z.B. auf Breakeven)."""
+    url = f"{CAPITAL_BASE}/api/v1/positions/{deal_id}"
+    headers = {"CST": cst, "X-SECURITY-TOKEN": xsec, "Content-Type": "application/json"}
+    body = {"stopLevel": round(stop_level, digits)}
+    try:
+        r = requests.put(url, headers=headers, json=body, timeout=15)
+        return r.status_code in (200, 201)
+    except Exception:
+        return False
+
 def capital_place_order_grow(cst, xsec, epic, direction, size, level, sl, tp, digits) -> dict:
     """
     Platziert eine MARKT-Order (Einstieg sofort) mit Stop UND Take-Profit.
@@ -1110,7 +1188,7 @@ def execute_trade_capital(t: dict) -> str:
         per = min_size
     per = round(max(per, 0.01) * CAPITAL_SIZE_FACTOR, 2)   # ← Größen-Hebel wirkt jetzt wirklich
 
-    lines, ok_count, used = [], 0, None
+    lines, ok_count, used, deal_refs = [], 0, None, []
     for i, tp in enumerate(tps, 1):
         start = used if used else per          # nach 1. Treffer gleiche Size weiterverwenden
         res = capital_place_order_grow(cst, xsec, epic, direction, start,
@@ -1118,16 +1196,24 @@ def execute_trade_capital(t: dict) -> str:
         if res["ok"]:
             ok_count += 1
             used = res["size"]
+            deal_refs.append(res["id"])
             typ = "Limit" if res.get("type") == "LIMIT" else "Markt"
             lines.append(f"  ✅ Teil-Order {i}/{len(tps)} → TP{i} | {typ} | Size {res['size']} (Ref {res['id'][:10]})")
         else:
             lines.append(f"  ❌ Teil-Order {i}: {res['err']}")
 
+    # Position-IDs auflösen (für späteres Breakeven-Nachziehen)
+    deal_ids = []
+    for ref in deal_refs:
+        did = capital_deal_id(cst, xsec, ref)
+        if did:
+            deal_ids.append(did)
+
     head = (f"📈 {pair} {direction} ({epic}) — {ok_count}/{len(tps)} Orders ({CAPITAL_ENV})\n")
-    # Order-Infos fürs Dashboard merken
+    # Order-Infos fürs Dashboard + Breakeven merken
     last_exec.clear()
     last_exec.update({"size": used, "orders_ok": ok_count, "orders_total": len(tps),
-                      "order_type": "Markt"})
+                      "order_type": "Markt", "deal_ids": deal_ids})
     note = ""
     if ok_count and used and used > per + 0.001:
         note = (f"\n\nℹ️ Größe automatisch auf {used} angehoben (Capital-Mindestgröße). "
@@ -1277,6 +1363,8 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if TRADING_ENABLED and broker_configured():
         trade_mode += "\n⚡ Auto-Trade: " + ("AN (Signale werden automatisch ausgeführt)"
                                              if AUTO_TRADE else "aus (Bestätigung per Accept)")
+        trade_mode += "\n🔒 Breakeven: " + (f"ab +{BREAKEVEN_AT_R}R Stop auf Einstieg"
+                                            if BREAKEVEN_ENABLED else "aus")
     analyse = "KI (Sonnet+Suche)" if USE_AI_ANALYSIS else "Technik (kostenlos)"
     await update.message.reply_text(
         f"📊 Status\nMarkt: {mo}\n"
@@ -1462,6 +1550,7 @@ def dashboard_payload() -> dict:
         "env": (CAPITAL_ENV if BROKER == "capital" else OANDA_ENV),
         "trading_enabled": bool(TRADING_ENABLED and broker_configured()),
         "auto_trade": bool(AUTO_TRADE and TRADING_ENABLED and broker_configured()),
+        "breakeven": (BREAKEVEN_AT_R if BREAKEVEN_ENABLED else None),
         "pairs": PAIRS,
         "signals_today": signals_today,
         "max_signals_day": MAX_SIGNALS_DAY,
