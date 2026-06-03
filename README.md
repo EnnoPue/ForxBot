@@ -63,6 +63,22 @@ Dann kommt jedes Signal mit Buttons:
 Alternativ OANDA: `BROKER=oanda` + `OANDA_TOKEN`, `OANDA_ACCOUNT_ID`, `OANDA_ENV=practice`.
 Ohne Trading-Variablen kommen die Signale einfach als Text.
 
+## 📈 Performance-Dashboard
+Der Bot startet automatisch einen kleinen Webserver und liefert ein Dashboard, das zeigt:
+welche Positionen vorgeschlagen wurden, welche **du** geöffnet hast (mit echter Order-Größe),
+Trefferquote (Bot-Signale **und** von dir geöffnet getrennt), Erwartungswert, Profit-Faktor,
+kumulierte R-Entwicklung als Kurve und eine Trefferquote je Paar. Ergebnisse (TP1 vs. SL) werden
+bei jedem Scan **automatisch** preisbasiert nachgetragen.
+
+**So rufst du es auf (Railway):**
+1. Railway → dein Service → **Settings → Networking → Generate Domain** (Port `8080`, bzw. der vom Bot gebundene `$PORT`).
+2. Die erzeugte URL im Browser öffnen → Dashboard. `…/api/data` liefert die Rohdaten als JSON.
+3. **Dauerhafte Historie über Redeploys hinweg:** Railway → **Volumes** → ein Volume mounten (z.B. `/data`) und Variable `STATE_DIR=/data` setzen. Sonst wird das Log bei jedem Neu-Deploy zurückgesetzt (Railway-Dateisystem ist sonst flüchtig).
+
+**Alternativ auf Netlify hosten:** `dashboard.html` zu Netlify hochladen, öffnen, und im gelben Banner die Bot-URL eintragen (wird lokal gespeichert). CORS ist aktiv, der Cross-Origin-Abruf funktioniert.
+
+Relevante Variablen: `STATE_DIR` (Speicherort, für Volume), `PORT`/`DASHBOARD_PORT` (Webserver-Port).
+
 ## Befehle
 /status — Markt, Session, Analyse-Modus, Trading-Status (Broker + Demo/Live)
 /scan — sofort scannen (meldet Ergebnis direkt)
