@@ -273,7 +273,7 @@ def mark_trade_opened(rid: str):
             r["order_type"] = last_exec.get("order_type")
             r["exec_size"] = last_exec.get("size")
             r["orders_ok"] = last_exec.get("orders_ok")
-            r["capital_deals"] = last_exec.get("deal_ids") or []   # für Breakeven
+            r["capital_deals"] = last_exec.get("deal_map") or []   # [{id, tp}] für Breakeven (TP bleibt)
             r["be_done"] = False                                    # Stop schon auf BE gezogen?
             save_trade_log()
             return
@@ -344,10 +344,17 @@ def process_breakevens(prices: dict) -> list:
         progress = (price - entry) if direction == "long" else (entry - price)
         if progress < BREAKEVEN_AT_R * risk - 1e-9:    # erst ab BREAKEVEN_AT_R Gewinn (float-robust)
             continue
-        # Stop auf Einstieg ziehen (Breakeven) — ALLE Teil-Positionen, nicht abbrechen
+        # Stop auf Einstieg ziehen (Breakeven) — TP je Position mitschicken, ALLE updaten
         digits = capital_digits(r["pair"])
-        results = [capital_update_stop(cst, xsec, did, entry, digits)
-                   for did in r["capital_deals"]]
+        results = []
+        for deal in r["capital_deals"]:
+            if isinstance(deal, dict):
+                did, tp = deal.get("id"), deal.get("tp")
+            else:
+                did, tp = deal, None           # Altformat (nur ID) — best effort
+            if not did:
+                continue
+            results.append(capital_update_stop(cst, xsec, did, entry, tp, digits))
         ok_any = any(results)
         if ok_any:
             r["be_done"] = True
@@ -1136,14 +1143,31 @@ def capital_deal_id(cst, xsec, deal_ref: str):
         pass
     return None
 
-def capital_update_stop(cst, xsec, deal_id: str, stop_level: float, digits: int) -> bool:
-    """Verschiebt den Stop einer offenen Position (z.B. auf Breakeven)."""
+def capital_update_stop(cst, xsec, deal_id: str, stop_level: float,
+                        profit_level: float | None, digits: int) -> bool:
+    """Verschiebt den Stop einer offenen Position und BEHÄLT den Take-Profit.
+    Prüft die Bestätigung (Amend ist asynchron → HTTP 200 allein reicht nicht)."""
     url = f"{CAPITAL_BASE}/api/v1/positions/{deal_id}"
     headers = {"CST": cst, "X-SECURITY-TOKEN": xsec, "Content-Type": "application/json"}
     body = {"stopLevel": round(stop_level, digits)}
+    if profit_level is not None:
+        body["profitLevel"] = round(profit_level, digits)   # TP MITSCHICKEN, sonst löscht Capital ihn
     try:
         r = requests.put(url, headers=headers, json=body, timeout=15)
-        return r.status_code in (200, 201)
+        if r.status_code not in (200, 201):
+            return False
+        ref = (r.json() or {}).get("dealReference")
+        if not ref:
+            return True
+        # Bestätigung prüfen — nur bei explizitem REJECTED als Fehler werten
+        for _ in range(3):
+            c = requests.get(f"{CAPITAL_BASE}/api/v1/confirms/{ref}", headers=headers, timeout=15)
+            if c.status_code == 200:
+                d = c.json() or {}
+                status = str(d.get("dealStatus") or d.get("status") or "").upper()
+                return status != "REJECTED"
+            _time.sleep(0.4)
+        return True
     except Exception:
         return False
 
@@ -1188,7 +1212,7 @@ def execute_trade_capital(t: dict) -> str:
         per = min_size
     per = round(max(per, 0.01) * CAPITAL_SIZE_FACTOR, 2)   # ← Größen-Hebel wirkt jetzt wirklich
 
-    lines, ok_count, used, deal_refs = [], 0, None, []
+    lines, ok_count, used, order_results = [], 0, None, []
     for i, tp in enumerate(tps, 1):
         start = used if used else per          # nach 1. Treffer gleiche Size weiterverwenden
         res = capital_place_order_grow(cst, xsec, epic, direction, start,
@@ -1196,24 +1220,24 @@ def execute_trade_capital(t: dict) -> str:
         if res["ok"]:
             ok_count += 1
             used = res["size"]
-            deal_refs.append(res["id"])
+            order_results.append((res["id"], tp))     # Order-Ref + zugehöriger TP
             typ = "Limit" if res.get("type") == "LIMIT" else "Markt"
             lines.append(f"  ✅ Teil-Order {i}/{len(tps)} → TP{i} | {typ} | Size {res['size']} (Ref {res['id'][:10]})")
         else:
             lines.append(f"  ❌ Teil-Order {i}: {res['err']}")
 
-    # Position-IDs auflösen (für späteres Breakeven-Nachziehen)
-    deal_ids = []
-    for ref in deal_refs:
+    # Position-IDs auflösen und mit ihrem TP speichern (fürs Breakeven, TP bleibt erhalten)
+    deal_map = []
+    for ref, tp in order_results:
         did = capital_deal_id(cst, xsec, ref)
         if did:
-            deal_ids.append(did)
+            deal_map.append({"id": did, "tp": round(tp, digits)})
 
     head = (f"📈 {pair} {direction} ({epic}) — {ok_count}/{len(tps)} Orders ({CAPITAL_ENV})\n")
     # Order-Infos fürs Dashboard + Breakeven merken
     last_exec.clear()
     last_exec.update({"size": used, "orders_ok": ok_count, "orders_total": len(tps),
-                      "order_type": "Markt", "deal_ids": deal_ids})
+                      "order_type": "Markt", "deal_map": deal_map})
     note = ""
     if ok_count and used and used > per + 0.001:
         note = (f"\n\nℹ️ Größe automatisch auf {used} angehoben (Capital-Mindestgröße). "
