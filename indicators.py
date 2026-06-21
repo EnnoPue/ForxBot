@@ -68,6 +68,8 @@ def analyze(df: pd.DataFrame) -> dict:
     closes = df["close"]
     e20, e50, e200 = ema(closes, 20), ema(closes, 50), ema(closes, 200)
     r = rsi(closes)
+    r2 = rsi(closes, 2)                                  # Connors RSI(2) für STRATEGY=rsi2
+    sma200 = closes.rolling(200).mean() if len(closes) >= 200 else closes.expanding().mean()
     macd_line, sig_line, hist = macd(closes)
     a = atr(df)
     adx_series = adx(df)
@@ -89,11 +91,14 @@ def analyze(df: pd.DataFrame) -> dict:
         "price": price,
         "ema20": float(last_e20), "ema50": float(last_e50), "ema200": float(last_e200),
         "rsi": float(r.iloc[-1]),
+        "rsi2": float(r2.iloc[-1]),
+        "sma200": float(sma200.iloc[-1]),
         "macd": float(macd_line.iloc[-1]), "macd_signal": float(sig_line.iloc[-1]),
         "macd_hist": float(hist.iloc[-1]), "macd_hist_prev": float(hist.iloc[-2]),
         "atr": float(a.iloc[-1]),
         "adx": float(adx_series.iloc[-1]),
         "bb_upper": float(bb_up.iloc[-1]), "bb_lower": float(bb_lo.iloc[-1]),
+        "bb_mid": float(bb_mid.iloc[-1]),
         "swing_high": swing_high, "swing_low": swing_low,
         "trend": trend,
     }
